@@ -37,23 +37,31 @@ echo "Stopping running Side Screen..."
 pkill -f SideScreen 2>/dev/null || true
 sleep 0.5
 
+# Where SwiftPM keeps its build artifacts and build.db. Overridable because on some
+# setups a checkout under ~/Documents makes SwiftPM's SQLite build database fail with
+# "accessing build database ...: disk I/O error" — the compile succeeds but the exit
+# status is non-zero, so `set -e` aborts before the second architecture is built.
+# Point this somewhere outside the synced/managed tree to work around it, e.g.
+#   SCRATCH_PATH=/tmp/sidescreen-build ./scripts/build_mac.sh
+SCRATCH_PATH="${SCRATCH_PATH:-$ROOT_DIR/MacHost/.build}"
+
 # Clean old build
 echo "Cleaning old build..."
-rm -rf .build
+rm -rf "$SCRATCH_PATH"
 
 # Build fresh (Universal Binary: arm64 + x86_64)
 echo "Building macOS Host (arm64)..."
-swift build -c release --arch arm64
+swift build -c release --arch arm64 --scratch-path "$SCRATCH_PATH"
 
 echo "Building macOS Host (x86_64)..."
-swift build -c release --arch x86_64
+swift build -c release --arch x86_64 --scratch-path "$SCRATCH_PATH"
 
 echo "Creating Universal Binary..."
-mkdir -p ".build/release-universal"
+mkdir -p "$SCRATCH_PATH/release-universal"
 lipo -create \
-  .build/arm64-apple-macosx/release/SideScreen \
-  .build/x86_64-apple-macosx/release/SideScreen \
-  -output .build/release-universal/SideScreen
+  "$SCRATCH_PATH/arm64-apple-macosx/release/SideScreen" \
+  "$SCRATCH_PATH/x86_64-apple-macosx/release/SideScreen" \
+  -output "$SCRATCH_PATH/release-universal/SideScreen"
 
 # Create .app bundle
 APP_NAME="SideScreen"
@@ -65,7 +73,7 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 # Copy universal binary
-cp .build/release-universal/SideScreen "$APP_DIR/Contents/MacOS/"
+cp "$SCRATCH_PATH/release-universal/SideScreen" "$APP_DIR/Contents/MacOS/"
 
 # Copy app icon if exists
 if [ -f "$ROOT_DIR/MacHost/Resources/AppIcon.icns" ]; then

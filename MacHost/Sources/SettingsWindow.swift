@@ -1281,8 +1281,19 @@ class DisplaySettings: ObservableObject {
         resolutionGroups.flatMap { $0.resolutions }
     }
 
+    /// What a 5 GHz link can realistically sustain. The USB-oriented default asks for
+    /// 1000 Mbps, which is effectively "no limit" — that is what let the encoder
+    /// outrun WiFi and pile up latency. USB keeps whatever the user chose.
+    static let wirelessBitrateCeilingMbps = 25
+
     var effectiveBitrate: Int {
-        return gamingBoost ? 1000 : bitrate
+        // Gaming Boost previously reported 1000 here while VideoEncoder silently
+        // clamped itself to 50, so the settings window showed a number the encoder
+        // never used. Decide it once, in one place.
+        let requested = gamingBoost ? 50 : bitrate
+        return connectionMode == .wireless
+            ? min(requested, Self.wirelessBitrateCeilingMbps)
+            : requested
     }
 
     var effectiveQuality: String {

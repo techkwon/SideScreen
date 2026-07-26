@@ -284,6 +284,19 @@ class ScreenCapture {
                 return
             }
 
+            // Network backpressure. The encode queue limit above only bounds encoding;
+            // the socket was free to accumulate frames without limit, which on WiFi
+            // let the picture drift seconds behind. Dropping the frame here, before it
+            // reaches the encoder, lowers the effective frame rate instead of punching
+            // a hole in the GOP.
+            if self.currentServer?.isSendBacklogged == true {
+                // The browser viewer paces itself independently, so keep feeding it.
+                if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) ?? self.lastPixelBuffer {
+                    self.browserServer?.updateFrame(pixelBuffer: imageBuffer)
+                }
+                return
+            }
+
             if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
                 self.lastPixelBuffer = imageBuffer
                 self.browserServer?.updateFrame(pixelBuffer: imageBuffer)

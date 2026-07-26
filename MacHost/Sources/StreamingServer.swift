@@ -65,8 +65,25 @@ class StreamingServer {
         // Guards the one-shot startup path on its own, so `connectionReady` can
         // stay false until the display config is actually on the wire.
         var startupClaimed = false
+        var inFlightFrames = 0
     }
     private let sendLock = OSAllocatedUnfairLock(initialState: SendState())
+
+    /// Frames handed to the socket but not yet drained before the capture side
+    /// should stop feeding the encoder.
+    private static let maxInFlightFrames = 2
+
+    /// True while the socket is still working through what it was already given.
+    ///
+    /// The capture side consults this *before* encoding. Skipping a frame at that
+    /// point simply makes the GOP sparser; dropping an already-encoded P-frame
+    /// instead would break the client's reference chain and leave it decoding
+    /// garbage until the next keyframe. Without this the send queue was unbounded —
+    /// on a link slower than the encoder, latency grew until the picture ran
+    /// seconds behind and never recovered.
+    var isSendBacklogged: Bool {
+        sendLock.withLock { $0.inFlightFrames >= Self.maxInFlightFrames }
+    }
 
     // Stats counters. Incremented from the encoder thread and from send
     // completion handlers on networkQueue, drained on frameQueue.
@@ -140,6 +157,7 @@ class StreamingServer {
             state.clientSupportsFrameMetadata = false
             state.waitingForSyncFrame = true
             state.startupClaimed = false
+            state.inFlightFrames = 0
         }
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -507,9 +525,12 @@ class StreamingServer {
         frameQueue.async { [weak self] in
             guard let self = self else { return }
 
+            self.sendLock.withLock { $0.inFlightFrames += 1 }
             connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                self.sendLock.withLock { $0.inFlightFrames = max(0, $0.inFlightFrames - 1) }
                 if error != nil {
-                    self?.statsLock.withLock { $0.droppedFrames += 1 }
+                    self.statsLock.withLock { $0.droppedFrames += 1 }
                 }
             })
 

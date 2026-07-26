@@ -186,11 +186,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Observer cho bitrate/quality changes (chỉ khi không gaming boost)
         Publishers.CombineLatest(settings.$bitrate, settings.$quality)
             .dropFirst()
-            .sink { [weak self] bitrate, quality in
+            .sink { [weak self] _, quality in
                 guard let self = self, self.settings.isRunning, !self.settings.gamingBoost else { return }
-                print("⚙️ Settings updated: \(bitrate)Mbps, \(quality)")
+                // effectiveBitrate, not the raw slider value — otherwise changing the
+                // slider mid-session silently escapes the wireless ceiling.
+                print("⚙️ Settings updated: \(self.settings.effectiveBitrate)Mbps, \(quality)")
                 self.screenCapture?.updateEncoderSettings(
-                    bitrateMbps: bitrate,
+                    bitrateMbps: self.settings.effectiveBitrate,
                     quality: quality,
                     gamingBoost: false
                 )

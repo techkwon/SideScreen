@@ -29,7 +29,10 @@ class VideoEncoder {
     init(width: Int, height: Int, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60) {
         self.width = width
         self.height = height
-        self.bitrateMbps = gamingBoost ? 50 : bitrateMbps
+        // Gaming Boost used to pin this to 50 regardless of what was passed, which
+        // made a lower wireless budget unreachable. The caller already folds Gaming
+        // Boost into the number it sends (SettingsStore.effectiveBitrate).
+        self.bitrateMbps = bitrateMbps
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
         self.frameRate = frameRate
@@ -37,7 +40,10 @@ class VideoEncoder {
     }
 
     func updateSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
-        self.bitrateMbps = gamingBoost ? 50 : bitrateMbps
+        // Gaming Boost used to pin this to 50 regardless of what was passed, which
+        // made a lower wireless budget unreachable. The caller already folds Gaming
+        // Boost into the number it sends (SettingsStore.effectiveBitrate).
+        self.bitrateMbps = bitrateMbps
         self.quality = gamingBoost ? "ultralow" : quality
         self.gamingBoost = gamingBoost
 
@@ -76,11 +82,11 @@ class VideoEncoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
 
-        // Dynamic bitrate - remove strict rate limiting for smoother streaming
-        // All-intra needs higher bitrate for text sharpness
-        // USB-C supports 5Gbps, so 80-100Mbps is fine
-        let effectiveBitrate = gamingBoost ? bitrateMbps : max(bitrateMbps, 60)
-        let bitrateBps = effectiveBitrate * 1_000_000
+        // Dynamic bitrate - remove strict rate limiting for smoother streaming.
+        // The old `max(bitrateMbps, 60)` floor dated from the all-intra era and
+        // silently overrode anything lower, which made a wireless budget impossible
+        // to express. The caller decides now (see SettingsStore.effectiveBitrate).
+        let bitrateBps = bitrateMbps * 1_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
         // Removed DataRateLimits - was causing bursty traffic and buffer stalls
 
