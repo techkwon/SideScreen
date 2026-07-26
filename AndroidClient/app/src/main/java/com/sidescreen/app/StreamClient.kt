@@ -353,6 +353,29 @@ class StreamClient(
         }
     }
 
+    fun sendRotationRequest(rotation: Int) {
+        if (!isConnected) return
+
+        val normalized =
+            when (rotation) {
+                90, 180, 270 -> rotation
+                else -> 0
+            }
+        touchScope.launch {
+            try {
+                outputStream?.let { out ->
+                    val buffer = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN)
+                    buffer.put(MESSAGE_ROTATION_REQUEST.toByte())
+                    buffer.putInt(normalized)
+                    out.write(buffer.array())
+                    out.flush()
+                    diagLog("Requested host rotation: $normalized")
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Callback for latency measurement (round-trip ping/pong)
     var onLatencyMeasured: ((Double) -> Unit)? = null
 
@@ -545,6 +568,7 @@ class StreamClient(
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
+        private const val MESSAGE_ROTATION_REQUEST = 9
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

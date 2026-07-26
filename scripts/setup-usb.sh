@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+STREAM_PORT="${STREAM_PORT:-54321}"
+HEALTH_PORT="${HEALTH_PORT:-$((STREAM_PORT + 1))}"
+CAMERA_PORT="${CAMERA_PORT:-54323}"
+
 echo "🔧 Setting up USB port forwarding..."
 
 # Check ADB connection
@@ -24,11 +28,13 @@ adb reverse --remove-all 2>/dev/null || true
 sleep 0.5
 
 # Setup new reverse
-echo "  Setting up port 8888..."
-adb reverse tcp:8888 tcp:8888
+echo "  Setting up ports $STREAM_PORT, $HEALTH_PORT and $CAMERA_PORT..."
+adb reverse "tcp:$STREAM_PORT" "tcp:$STREAM_PORT"
+adb reverse "tcp:$HEALTH_PORT" "tcp:$HEALTH_PORT"
+adb reverse "tcp:$CAMERA_PORT" "tcp:$CAMERA_PORT"
 
 # Verify
-if adb reverse --list | grep -q "tcp:8888"; then
+if adb reverse --list | grep -q "tcp:$STREAM_PORT" && adb reverse --list | grep -q "tcp:$HEALTH_PORT" && adb reverse --list | grep -q "tcp:$CAMERA_PORT"; then
     echo ""
     echo "✅ USB port forwarding active!"
     echo ""

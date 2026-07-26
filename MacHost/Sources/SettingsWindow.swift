@@ -248,6 +248,11 @@ struct SettingsView: View {
                                             .controlSize(.small)
                                         }
                                     }
+                                    if settings.isRunning {
+                                        Text("Resolution changes restart the stream to recreate the virtual display.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.orange)
+                                    }
                                 }
 
                                 // HiDPI (Retina)
@@ -680,6 +685,8 @@ struct SettingsView: View {
                             }
                         }
 
+                        GalaxyCameraPreviewPanel()
+
                         // Performance (when connected)
                         if settings.clientConnected {
                             FrostedGroupBox(title: "Performance", icon: "speedometer") {
@@ -876,6 +883,163 @@ struct StatusRow: View {
 }
 
 @available(macOS 14.0, *)
+struct GalaxyCameraPreviewPanel: View {
+    @State private var frameImage: NSImage?
+    @State private var copiedLabel: String?
+    @State private var wirelessPairURL: String?
+    @State private var wirelessQRImage: NSImage?
+    private let refreshTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+    private let previewURL = "http://127.0.0.1:\(GalaxyCameraPreviewServer.defaultPort)/"
+    private let streamURL = "http://127.0.0.1:\(GalaxyCameraPreviewServer.defaultPort)/stream.mjpg"
+    private let maxFrameAge: TimeInterval = 2.0
+
+    var body: some View {
+        FrostedGroupBox(title: "Galaxy Camera", icon: "camera") {
+            VStack(alignment: .leading, spacing: 12) {
+                if let frameImage {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black)
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        Image(nsImage: frameImage)
+                            .resizable()
+                            .scaledToFit()
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    URLCopyRow(
+                        title: "Preview URL",
+                        url: previewURL,
+                        copied: copiedLabel == "preview",
+                        action: { copy(previewURL, label: "preview") }
+                    )
+                    URLCopyRow(
+                        title: "Stream URL",
+                        url: streamURL,
+                        copied: copiedLabel == "stream",
+                        action: { copy(streamURL, label: "stream") }
+                    )
+                    if let wirelessPairURL {
+                        URLCopyRow(
+                            title: "Wireless Pair URL",
+                            url: wirelessPairURL,
+                            copied: copiedLabel == "wirelessCamera",
+                            action: { copy(wirelessPairURL, label: "wirelessCamera") }
+                        )
+                    }
+                }
+
+                VStack(alignment: .center, spacing: 8) {
+                    if let wirelessQRImage {
+                        Image(nsImage: wirelessQRImage)
+                            .interpolation(.none)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 132, height: 132)
+                            .padding(8)
+                            .background(Color.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        Text("Scan for wireless Galaxy camera")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("Wi-Fi disconnected — camera QR unavailable")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .onAppear {
+            loadFrame()
+            refreshWirelessPairing()
+        }
+        .onReceive(refreshTimer) { _ in
+            loadFrame()
+            refreshWirelessPairing()
+        }
+    }
+
+    private func loadFrame() {
+        let url = GalaxyCameraServer.latestFrameURL
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modified = attributes[.modificationDate] as? Date,
+              Date().timeIntervalSince(modified) <= maxFrameAge,
+              let image = NSImage(contentsOf: url) else {
+            frameImage = nil
+            return
+        }
+        frameImage = image
+    }
+
+    private func refreshWirelessPairing() {
+        guard let host = LANAddressResolver.primaryIPv4() else {
+            wirelessPairURL = nil
+            wirelessQRImage = nil
+            return
+        }
+        let nextURL = PairingURL.buildCameraPairPageURL(
+            host: host,
+            previewPort: GalaxyCameraPreviewServer.defaultPort,
+            cameraPort: GalaxyCameraServer.defaultPort
+        )
+        if nextURL != wirelessPairURL {
+            wirelessPairURL = nextURL
+            wirelessQRImage = QRRenderer.render(url: nextURL, size: 132)
+        }
+    }
+
+    private func copy(_ value: String, label: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        copiedLabel = label
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+            if copiedLabel == label {
+                copiedLabel = nil
+            }
+        }
+    }
+}
+
+@available(macOS 14.0, *)
+struct URLCopyRow: View {
+    let title: String
+    let url: String
+    let copied: Bool
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                Text(url)
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+            Button(action: action) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help(copied ? "Copied" : "Copy")
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+@available(macOS 14.0, *)
 struct ResolutionRow: View {
     let resolution: String
     let isSelected: Bool
@@ -1068,8 +1232,8 @@ class DisplaySettings: ObservableObject {
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
-        let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
-        self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
+        let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.wireless.rawValue
+        self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .wireless
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1089,6 +1253,9 @@ class DisplaySettings: ObservableObject {
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
             "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
         ]),
+        ResolutionGroup(name: "Galaxy Fold", ratio: "Inner Display", resolutions: [
+            "2160x1856", "2176x1812", "2208x1768", "2184x1968", "2152x1536"
+        ]),
         ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
             "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"
         ]),
@@ -1107,7 +1274,7 @@ class DisplaySettings: ObservableObject {
     ]
 
     static let commonResolutions = [
-        "1920x1080", "1920x1200", "2560x1440", "2560x1600"
+        "1920x1080", "2160x1856", "2176x1812", "2208x1768", "2560x1600"
     ]
 
     static var allResolutions: [String] {
@@ -1133,7 +1300,7 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled"]
+                    "customWidth", "customHeight", "touchEnabled", "connectionMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1150,6 +1317,7 @@ class DisplaySettings: ObservableObject {
         customWidth = 1920
         customHeight = 1200
         touchEnabled = true
+        connectionMode = .wireless
 
         print("Settings reset to defaults")
     }
@@ -1270,7 +1438,7 @@ struct WirelessSection: View {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
-                    Text("Click Start at the top to begin listening, then scan the QR.")
+                    Text("Click Start at the top, then scan the QR with the Android camera.")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                     Spacer()
@@ -1293,11 +1461,11 @@ struct WirelessSection: View {
                     } else {
                         Text("Generating QR…").foregroundColor(.secondary)
                     }
-                    Text("Scan this QR from Side Screen Android (Wireless tab)")
+                    Text("Scan with the Android camera to open in a browser")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
+                    Text(LANAddressResolver.primaryIPv4().map { "Browser: \($0):\(BrowserStreamServer.webPort(for: settings.port))" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1389,8 +1557,7 @@ struct WirelessSection: View {
     private func refreshQR() {
         let token = WirelessAuth.loadOrCreate()
         let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
-        let name = Host.current().localizedName ?? "Mac"
-        let url = PairingURL.build(host: host, port: settings.port, token: token, name: name)
+        let url = BrowserStreamServer.buildURL(host: host, streamPort: settings.port, token: token)
         qrImage = QRRenderer.render(url: url, size: 180)
     }
 

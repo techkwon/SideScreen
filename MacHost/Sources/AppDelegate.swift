@@ -5,6 +5,17 @@ import ApplicationServices
 import os.log
 @preconcurrency import ScreenCaptureKit
 
+enum SideScreenStartError: Error, LocalizedError {
+    case usbDeviceUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .usbDeviceUnavailable:
+            return "USB mode needs an authorized Android Debugging device before starting. Reconnect USB-C, unlock the Android device, and accept the USB debugging prompt."
+        }
+    }
+}
+
 // Debug file logger - writes to /tmp/sidescreen.log
 func debugLog(_ message: String) {
     let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
@@ -48,6 +59,9 @@ struct GestureThresholds {
 @available(macOS 14.0, *)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var streamingServer: StreamingServer?
+    var browserStreamServer: BrowserStreamServer?
+    var galaxyCameraServer: GalaxyCameraServer?
+    var galaxyCameraPreviewServer: GalaxyCameraPreviewServer?
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
     var settings = DisplaySettings()
@@ -61,6 +75,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
+    private var isStartingServer = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
@@ -73,6 +88,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup settings observers
         setupSettingsObservers()
+
+        let cameraServer = GalaxyCameraServer()
+        galaxyCameraServer = cameraServer
+        galaxyCameraServer?.start()
+        galaxyCameraPreviewServer = GalaxyCameraPreviewServer {
+            cameraServer.latestFrameData()
+        }
+        galaxyCameraPreviewServer?.start()
 
         // Check permissions
         Task {
@@ -174,13 +197,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Observer cho rotation changes - send to connected client immediately
-        settings.$rotation
+        // Display geometry changes require a new virtual display. Recreate the
+        // stream so the browser/native clients receive the newly selected size.
+        Publishers.CombineLatest4(
+            settings.$resolution,
+            settings.$hiDPI,
+            settings.$refreshRate,
+            settings.$rotation
+        )
             .dropFirst()
-            .sink { [weak self] rotation in
+            .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
+            .sink { [weak self] resolution, hiDPI, refreshRate, rotation in
                 guard let self = self, self.settings.isRunning else { return }
-                print("🔄 Rotation changed to \(rotation)°")
-                self.streamingServer?.updateRotation(rotation)
+                Task { @MainActor in
+                    await self.restartServerForDisplayChange(
+                        reason: "\(resolution), HiDPI=\(hiDPI), \(refreshRate)Hz, rotation=\(rotation)"
+                    )
+                }
             }
             .store(in: &cancellables)
 
@@ -226,7 +259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         settings.onToggleServer = { [weak self] in
             guard let self else { return }
-            if self.settings.isRunning {
+            if self.settings.isRunning || self.isStartingServer {
                 self.stopServer()
             } else {
                 Task { [weak self] in
@@ -234,6 +267,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @MainActor
+    private func restartServerForDisplayChange(reason: String) async {
+        guard settings.isRunning else { return }
+        debugLog("Display settings changed — recreating virtual display: \(reason)")
+        stopServer()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        await startServer()
     }
 
     @objc func showSettings() {
@@ -299,92 +341,75 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Setup ADB reverse port forwarding for USB connection
     func setupADBReverse() async {
         let port = settings.port
-        print("🔌 Setting up ADB reverse for port \(port)...")
+        let healthPort = BrowserStreamServer.webPort(for: port)
+        debugLog("Setting up ADB reverse for ports \(port), \(healthPort)...")
 
-        await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
+        let result = await Task.detached(priority: .utility) { () -> (installed: Bool, deviceConnected: Bool, reverseConfigured: Bool) in
+            guard let finalAdbPath = StatusDetector.adbExecutablePath() else {
+                debugLog("ADB not found — USB mode cannot configure adb reverse. Install with: brew install android-platform-tools")
+                return (false, false, false)
             }
 
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
+            debugLog("Found ADB at: \(finalAdbPath)")
+            let devices = StatusDetector.usbDevices()
+            if devices.isEmpty {
+                debugLog("No authorized ADB device found. Connect USB-C and accept the USB debugging prompt on Android.")
+            } else {
+                debugLog("ADB devices: \(devices.joined(separator: ", "))")
             }
 
-            guard let finalAdbPath = adbPath else {
-                print("⚠️  ADB not found - USB connection may not work")
-                print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
-                return
-            }
-
-            print("📱 Found ADB at: \(finalAdbPath)")
+            let reversePorts = [port, healthPort, GalaxyCameraServer.defaultPort]
 
             // Retry adb reverse up to 3 times — handles first-install authorization delay
             for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
+                var failedOutputs: [String] = []
 
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
+                for reversePort in reversePorts {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: finalAdbPath)
+                    process.arguments = ["reverse", "tcp:\(reversePort)", "tcp:\(reversePort)"]
 
-                do {
-                    try process.run()
-                    process.waitUntilExit()
+                    let pipe = Pipe()
+                    process.standardOutput = pipe
+                    process.standardError = pipe
 
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
+                    do {
+                        try process.run()
+                        process.waitUntilExit()
 
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                        let output = String(data: data, encoding: .utf8) ?? ""
+
+                        if process.terminationStatus == 0 {
+                            debugLog("ADB reverse setup successful: tcp:\(reversePort) -> tcp:\(reversePort)")
+                        } else {
+                            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                            failedOutputs.append("tcp:\(reversePort): \(trimmed)")
                         }
+                    } catch {
+                        failedOutputs.append("tcp:\(reversePort): \(error.localizedDescription)")
                     }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
+                }
+
+                if failedOutputs.isEmpty {
+                    return (true, !devices.isEmpty, true)
+                } else {
+                    debugLog("ADB reverse attempt \(attempt)/3 failed: \(failedOutputs.joined(separator: "; "))")
                     if attempt < 3 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                 }
             }
 
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
+            debugLog("ADB reverse setup failed. Make sure USB debugging is authorized on the Android device.")
+            return (true, !devices.isEmpty, false)
         }.value
+
+        await MainActor.run {
+            settings.adbInstalled = result.installed
+            settings.usbDeviceConnected = result.deviceConnected
+            settings.adbReverseConfigured = result.reverseConfigured
+        }
     }
 
     @MainActor
@@ -411,15 +436,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startServer() async {
+        guard !isStartingServer else {
+            debugLog("Start ignored — server start already in progress")
+            return
+        }
+        isStartingServer = true
+        defer { isStartingServer = false }
+
+        if settings.isRunning ||
+            streamingServer != nil ||
+            browserStreamServer != nil ||
+            screenCapture != nil ||
+            virtualDisplayManager != nil {
+            debugLog("Cleaning up existing server state before start")
+            stopServer()
+            try? await Task.sleep(nanoseconds: 600_000_000)
+        }
+
         guard settings.hasScreenRecordingPermission else {
             await showPermissionAlert()
             return
         }
 
         do {
+            let size = try await resolvedDisplaySizeForStart()
+
             // Create virtual display and run ADB setup in parallel
             virtualDisplayManager = VirtualDisplayManager()
-            let size = settings.resolutionSize
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,
@@ -475,6 +518,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
             streamingServer?.touchEnabled = settings.touchEnabled
+            browserStreamServer = BrowserStreamServer(port: BrowserStreamServer.webPort(for: settings.port))
+            browserStreamServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
+            browserStreamServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
+                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            }
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
                 streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
@@ -502,6 +550,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
+            }
+            streamingServer?.onRotationRequested = { [weak self] rotation in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    let normalized = [0, 90, 180, 270].contains(rotation) ? rotation : 0
+                    guard self.settings.rotation != normalized else { return }
+                    debugLog("Applying client rotation request: \(normalized)°")
+                    self.settings.rotation = normalized
+                }
             }
 
             streamingServer?.onClientDisconnected = { [weak self] in
@@ -532,8 +589,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             streamingServer?.start()
+            browserStreamServer?.start()
             screenCapture?.startStreaming(
                 to: streamingServer,
+                browserServer: browserStreamServer,
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
@@ -560,12 +619,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func resolvedDisplaySizeForStart() async throws -> (width: Int, height: Int) {
+        guard settings.connectionMode == .usb else {
+            return settings.resolutionSize
+        }
+
+        var detectedSize: StatusDetector.AndroidDisplaySize?
+        for attempt in 1...5 {
+            if let androidSize = await StatusDetector.activeAndroidDisplaySize() {
+                detectedSize = androidSize
+                break
+            }
+
+            debugLog("USB device display auto-fit waiting for authorized ADB device (\(attempt)/5)")
+            if attempt < 5 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+
+        guard let androidSize = detectedSize else {
+            debugLog("USB device display auto-fit failed — authorized ADB device not available")
+            throw SideScreenStartError.usbDeviceUnavailable
+        }
+
+        await MainActor.run {
+            settings.customWidth = androidSize.width
+            settings.customHeight = androidSize.height
+            settings.resolution = androidSize.resolution
+        }
+
+        debugLog("USB device display auto-fit: \(androidSize.resolution)")
+        return (androidSize.width, androidSize.height)
+    }
+
     func stopServer() {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
 
-        screenCapture?.stopStreaming()
+        let capture = screenCapture
+        screenCapture = nil
+        capture?.stopStreaming()
         streamingServer?.stop()
+        browserStreamServer?.stop()
+        streamingServer = nil
+        browserStreamServer = nil
         virtualDisplayManager?.destroyDisplay()
 
         settings.isRunning = false
@@ -975,6 +1072,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Stop server and cleanup
         stopServer()
+        galaxyCameraPreviewServer?.stop()
+        galaxyCameraServer?.stop()
 
         // Cancel all combine subscriptions
         cancellables.removeAll()

@@ -2,6 +2,15 @@ import Foundation
 import SystemConfiguration
 
 enum StatusDetector {
+    struct AndroidDisplaySize: Equatable {
+        let width: Int
+        let height: Int
+
+        var resolution: String {
+            "\(width)x\(height)"
+        }
+    }
+
     static func adbInstalled() -> Bool {
         return adbExecutablePath() != nil
     }
@@ -37,7 +46,7 @@ enum StatusDetector {
         }
     }
 
-    /// Heuristic: parse `adb reverse --list` for `tcp:<port> tcp:<port>`.
+    /// Heuristic: parse `adb reverse --list` for the stream port and browser health port.
     static func adbReverseConfigured(port: Int) -> Bool {
         guard let adbPath = adbExecutablePath() else { return false }
         let task = Process()
@@ -54,13 +63,64 @@ enum StatusDetector {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
-        return output.contains("tcp:\(port) tcp:\(port)")
+        let healthPort = port < Int(UInt16.max) ? port + 1 : port - 1
+        return [port, healthPort].allSatisfy { output.contains("tcp:\($0) tcp:\($0)") }
+    }
+
+    /// Read the active Android display size reported by the connected USB device.
+    static func activeAndroidDisplaySize() async -> AndroidDisplaySize? {
+        await Task.detached(priority: .utility) {
+            activeAndroidDisplaySizeSync()
+        }.value
+    }
+
+    private static func activeAndroidDisplaySizeSync() -> AndroidDisplaySize? {
+        guard !usbDevices().isEmpty else { return nil }
+        guard let adbPath = adbExecutablePath() else { return nil }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: adbPath)
+        task.arguments = ["shell", "wm", "size"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard task.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return parseAndroidDisplaySize(output)
+    }
+
+    private static func parseAndroidDisplaySize(_ output: String) -> AndroidDisplaySize? {
+        let pattern = #"Physical size:\s*([0-9]+)x([0-9]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(output.startIndex..<output.endIndex, in: output)
+        guard let match = regex.firstMatch(in: output, range: range),
+              match.numberOfRanges == 3,
+              let widthRange = Range(match.range(at: 1), in: output),
+              let heightRange = Range(match.range(at: 2), in: output),
+              let width = Int(output[widthRange]),
+              let height = Int(output[heightRange]),
+              (640...7680).contains(width),
+              (480...4320).contains(height) else {
+            return nil
+        }
+
+        return AndroidDisplaySize(width: width, height: height)
     }
 
     private static var cachedAdbPath: String?
     private static var lastAdbCacheCheck: Date = .distantPast
 
-    private static func adbExecutablePath() -> String? {
+    static func adbExecutablePath() -> String? {
         // Re-resolve every 5 s so install/uninstall is reflected.
         if let cached = cachedAdbPath, Date().timeIntervalSince(lastAdbCacheCheck) < 5.0 {
             return cached

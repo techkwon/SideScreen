@@ -55,6 +55,7 @@ class ScreenCapture {
 
     // Streaming parameters (saved for restart)
     private weak var currentServer: StreamingServer?
+    private weak var browserServer: BrowserStreamServer?
     private var currentBitrateMbps: Int = 20
     private var currentQuality: String = "medium"
     private var currentGamingBoost: Bool = false
@@ -285,12 +286,14 @@ class ScreenCapture {
 
             if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
                 self.lastPixelBuffer = imageBuffer
+                self.browserServer?.updateFrame(pixelBuffer: imageBuffer)
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
                     self.encoder?.encode(pixelBuffer: imageBuffer, presentationTimeStamp: pts)
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
             } else if let cached = self.lastPixelBuffer {
+                self.browserServer?.updateFrame(pixelBuffer: cached)
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
                     self.encoder?.encode(pixelBuffer: cached, presentationTimeStamp: pts)
@@ -302,9 +305,17 @@ class ScreenCapture {
 
     // MARK: - Start streaming
 
-    func startStreaming(to server: StreamingServer?, bitrateMbps: Int = 20, quality: String = "medium", gamingBoost: Bool = false, frameRate: Int = 60) {
+    func startStreaming(
+        to server: StreamingServer?,
+        browserServer: BrowserStreamServer? = nil,
+        bitrateMbps: Int = 20,
+        quality: String = "medium",
+        gamingBoost: Bool = false,
+        frameRate: Int = 60
+    ) {
         // Save parameters for potential restart
         currentServer = server
+        self.browserServer = browserServer
         currentBitrateMbps = bitrateMbps
         currentQuality = quality
         currentGamingBoost = gamingBoost
@@ -315,7 +326,7 @@ class ScreenCapture {
 
         encoder = VideoEncoder(width: width, height: height, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: frameRate)
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
-            server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+            server?.sendFrame(&data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
 
         // Apply any keyframe request that arrived before the encoder existed
@@ -507,6 +518,7 @@ class ScreenCapture {
 
                 // Use CMClock for accurate timestamps instead of raw Mach time
                 let pts = CMClockGetTime(CMClockGetHostTimeClock())
+                self.browserServer?.updateFrame(pixelBuffer: pb)
                 self.encoder?.encode(pixelBuffer: pb, presentationTimeStamp: pts)
             }
         ) else {
@@ -538,10 +550,17 @@ class ScreenCapture {
         // Cancel frame flow monitor
         stopFrameMonitor()
 
-        // Stop SCStream
-        Task {
+        let streamToStop = stream
+        stream = nil
+        streamOutput?.onFrameReceived = nil
+        streamOutput = nil
+        streamDelegate = nil
+
+        // Stop SCStream after clearing local references so repeated stop/restart
+        // paths cannot submit stopCapture() against the same stream again.
+        Task { [streamToStop] in
             do {
-                try await stream?.stopCapture()
+                try await streamToStop?.stopCapture()
             } catch {
                 debugLog("Failed to stop SCStream capture: \(error)")
             }

@@ -55,7 +55,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ### USB-C or Wireless
 
-Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** lets you scan a QR code from the Mac once and the tablet auto-reconnects on every future launch over WiFi (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
+Two ways to connect, same picture quality. **USB-C** plugs in the cable for the lowest possible latency — adb-reverse port forwarding is set up automatically. **Wireless** shows a QR code on the Mac that opens the browser viewer directly from the phone or tablet Camera app over WiFi (5 GHz strongly recommended). The auth token is generated locally and stays on your Mac; reset it any time to revoke access.
 
 ### Virtual Display
 
@@ -108,7 +108,7 @@ Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–500
 | **OS** | macOS 14 (Sonoma)+ | Android 8.0 (API 26)+ |
 | **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
 | **USB mode** | USB-C port + `adb` (`brew install android-platform-tools`) | USB-C cable + USB Debugging enabled |
-| **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera (for QR scan) + Google Play Services (for ML Kit barcode) |
+| **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Any modern browser opened from the device Camera QR scan |
 
 ---
 
@@ -135,7 +135,7 @@ Download the latest release from [**GitHub Releases**](https://github.com/tranvu
 >    ```
 > 2. Install ADB:
 >    ```bash
->    brew install --cask android-platform-tools
+>    brew install android-platform-tools
 >    ```
 
 <details>
@@ -146,10 +146,12 @@ git clone https://github.com/tranvuongquocdat/SideScreen.git
 cd SideScreen
 
 # macOS
-cd MacHost && swift build -c release
+./scripts/build_mac.sh --reset-state
 
 # Android
 cd AndroidClient && ./gradlew assembleDebug
+
+# The reset step clears stale macOS privacy records after ad-hoc rebuilds.
 ```
 </details>
 
@@ -167,8 +169,8 @@ cd AndroidClient && ./gradlew assembleDebug
 ### Wireless mode (new in 0.8.0 — no cable)
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
-2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
-3. The tablet remembers the Mac. Subsequent launches auto-reconnect — no rescan.
+2. On the tablet or phone, open the built-in Camera app and scan the QR shown on the Mac
+3. Open the QR link in the browser viewer
 
 Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
@@ -206,6 +208,25 @@ Then open the app again.
 <summary><strong>"Connection refused" on Android</strong></summary>
 
 The Mac app sets up `adb reverse` automatically when streaming starts. If it still fails, make sure `adb` is installed (via Android SDK or Homebrew: `brew install android-platform-tools`) and your device has USB debugging enabled.
+
+USB mode uses two reverse ports:
+
+```bash
+adb reverse tcp:54321 tcp:54321   # native H.265 stream
+adb reverse tcp:54322 tcp:54322   # browser/health endpoint
+```
+</details>
+
+<details>
+<summary><strong>Rebuilt app cannot be enabled in macOS privacy settings</strong></summary>
+
+Local ad-hoc signing changes the app signature on every rebuild. If the old privacy entry blocks the new build, reset local state and re-register the app:
+
+```bash
+./scripts/reset_settings.sh
+```
+
+Then enable **SideScreen** in **System Settings -> Privacy & Security -> Screen & System Audio Recording**.
 </details>
 
 <details>
@@ -221,7 +242,7 @@ The Mac app sets up `adb reverse` automatically when streaming starts. If it sti
 <summary><strong>Wireless: "Couldn't reach Mac" / connection times out</strong></summary>
 
 - Both devices must be on the same WiFi network (and same subnet — some mesh routers isolate "guest" devices)
-- Click **Start** on the Mac before scanning the QR — the listener only binds when the server is running
+- Click **Start** on the Mac before opening the QR link — the listener only binds when the server is running
 - If the Mac changes WiFi or its LAN IP, scan a fresh QR (the cached one points to the old address)
 - macOS may prompt for **Local Network** permission on first wireless toggle — grant it; without it, LAN inbound is silently dropped
 </details>
@@ -229,13 +250,13 @@ The Mac app sets up `adb reverse` automatically when streaming starts. If it sti
 <details>
 <summary><strong>Wireless: "Re-pair required" after restart / reinstall</strong></summary>
 
-The Mac's auth token resets when you click **Reset Token (forget all)** or reinstall the app. Tap **Scan QR Code** on the Android client and scan the new QR shown on the Mac.
+The Mac's auth token resets when you click **Reset Token (forget all)** or reinstall the app. Scan the new QR shown on the Mac with the device Camera app.
 </details>
 
 <details>
 <summary><strong>Virtual display not appearing</strong></summary>
 
-Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable Side Screen**
+Grant Screen Recording permission: **System Settings -> Privacy & Security -> Screen & System Audio Recording -> Enable SideScreen**
 </details>
 
 ---

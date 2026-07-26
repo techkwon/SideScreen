@@ -4,12 +4,21 @@ import CoreMedia
 import os
 
 class VideoEncoder {
+    /// Scratch bytes reserved at the front of every encoded frame so the wire
+    /// header can be written in place. Sized for the largest header format
+    /// (`[type 1][size 4][keyframe 1][capture timestamp 8]`); the shorter legacy
+    /// header is written at the tail of the same region. Without this the whole
+    /// frame had to be copied into a fresh buffer just to prepend a few bytes.
+    static let headerRoom = 14
+
     private struct EncoderState {
         var pendingForceKeyframe = false
     }
 
     private var compressionSession: VTCompressionSession?
-    var onEncodedFrame: ((Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
+    // Passed `inout` so the header can be patched into the reserved room without
+    // tripping copy-on-write — the buffer must stay uniquely referenced.
+    var onEncodedFrame: ((inout Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
     private var width: Int
     private var height: Int
     private var bitrateMbps: Int = 20
@@ -130,10 +139,12 @@ class VideoEncoder {
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
 
-        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds
+        // Use system uptime clock — MUST match DispatchTime.now().uptimeNanoseconds.
+        // VideoToolbox treats sourceFrameRefcon as an opaque value and hands it back
+        // untouched, so the timestamp rides in the pointer's bit pattern rather than
+        // in an 8-byte heap block allocated and freed once per frame.
         let captureNanos = DispatchTime.now().uptimeNanoseconds
-        let refconValue = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
-        refconValue.storeBytes(of: captureNanos, as: UInt64.self)
+        let refconValue = UnsafeMutableRawPointer(bitPattern: UInt(captureNanos))
 
         let shouldForceKeyframe = stateLock.withLock { state -> Bool in
             guard state.pendingForceKeyframe else { return false }
@@ -175,11 +186,12 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
 
-    // Get timestamp for frame age tracking
+    // Get timestamp for frame age tracking. The refcon carries the capture time
+    // directly in its bit pattern (see encode); nil only when that value was zero,
+    // which uptime nanoseconds never realistically is.
     let timestamp: UInt64
     if let refcon = sourceFrameRefCon {
-        timestamp = refcon.load(as: UInt64.self)
-        refcon.deallocate()
+        timestamp = UInt64(UInt(bitPattern: refcon))
     } else {
         timestamp = DispatchTime.now().uptimeNanoseconds
     }
@@ -206,11 +218,16 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     // Check if this is a keyframe
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
-    let isKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+    let attachmentKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+    let nalKeyframe = containsHEVCSyncNALs(dataPointer: dataPointer, totalLength: totalLength)
+    let isKeyframe = attachmentKeyframe || nalKeyframe
 
     // Pre-allocate estimated size to reduce reallocations
-    let estimatedSize = totalLength + (isKeyframe ? 256 : 0) + 32
+    let estimatedSize = VideoEncoder.headerRoom + totalLength + (isKeyframe ? 256 : 0) + 32
     var frameData = Data(capacity: estimatedSize)
+    // Reserve (zero-filled) space for the wire header; StreamingServer patches it
+    // in place so the frame is never copied a second time on the way out.
+    frameData.count = VideoEncoder.headerRoom
 
     if isKeyframe {
         if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) {
@@ -247,5 +264,27 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         offset += Int(nalLength)
     }
 
-    encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
+    encoder.onEncodedFrame?(&frameData, timestamp, isKeyframe)
+}
+
+private func containsHEVCSyncNALs(dataPointer: UnsafeMutablePointer<Int8>, totalLength: Int) -> Bool {
+    var offset = 0
+    while offset + 6 <= totalLength {
+        var nalLength: UInt32 = 0
+        memcpy(&nalLength, dataPointer.advanced(by: offset), 4)
+        nalLength = UInt32(bigEndian: nalLength)
+        offset += 4
+
+        let length = Int(nalLength)
+        guard length > 1, offset + length <= totalLength else { return false }
+
+        let firstHeaderByte = UInt8(bitPattern: dataPointer.advanced(by: offset).pointee)
+        let nalType = (firstHeaderByte >> 1) & 0x3f
+        if (16...21).contains(nalType) {
+            return true
+        }
+
+        offset += length
+    }
+    return false
 }

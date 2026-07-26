@@ -4,6 +4,27 @@ set -e
 # Get absolute path to root directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RESET_STATE=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --reset-state)
+            RESET_STATE=1
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--reset-state]"
+            echo ""
+            echo "  --reset-state  After building, remove stale local privacy/defaults state"
+            echo "                 and re-register the rebuilt app."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            echo "Usage: $0 [--reset-state]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # Read version
 VERSION=$(cat "$ROOT_DIR/VERSION" | tr -d '[:space:]')
@@ -115,3 +136,9 @@ DMG_PATH="$ROOT_DIR/SideScreen-${VERSION}-mac-universal.dmg"
 hdiutil create -volname "Side Screen" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_PATH"
 rm -rf "$DMG_DIR"
 echo "DMG: $DMG_PATH"
+
+if [ "$RESET_STATE" -eq 1 ]; then
+    echo ""
+    echo "Resetting local app/privacy state for rebuilt app..."
+    APP_PATH="$APP_DIR" "$SCRIPT_DIR/reset_settings.sh"
+fi

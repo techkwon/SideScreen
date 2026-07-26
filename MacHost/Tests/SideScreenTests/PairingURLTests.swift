@@ -28,4 +28,14 @@ final class PairingURLTests: XCTestCase {
         let url = PairingURL.build(host: "1.2.3.4", port: 9, token: token, name: "Dat's MacBook")
         XCTAssertTrue(url.contains("name=Dat%27s%20MacBook") || url.contains("name=Dat's%20MacBook"))
     }
+
+    func testBuildCameraAppURLUsesCameraPath() {
+        let url = PairingURL.buildCameraAppURL(host: "192.168.1.42", port: 54323)
+        XCTAssertEqual(url, "sidescreen://192.168.1.42:54323/camera")
+    }
+
+    func testBuildCameraPairPageURLContainsEndpoint() {
+        let url = PairingURL.buildCameraPairPageURL(host: "192.168.1.42", previewPort: 54324, cameraPort: 54323)
+        XCTAssertEqual(url, "http://192.168.1.42:54324/camera-pair?h=192.168.1.42&p=54323")
+    }
 }

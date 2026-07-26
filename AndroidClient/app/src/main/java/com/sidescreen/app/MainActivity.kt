@@ -9,6 +9,7 @@ import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -32,16 +33,20 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.hypot
 import java.net.InetSocketAddress
 import java.net.Socket
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
+private const val MIN_VIEWPORT_SCALE = 1f
+private const val MAX_VIEWPORT_SCALE = 4f
+
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
-    private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
@@ -57,6 +62,25 @@ class MainActivity : AppCompatActivity() {
     private var isDraggingOverlay = false
     private var overlayDx = 0f
     private var overlayDy = 0f
+
+    // Local viewport zoom/pan. Two-finger gestures manipulate the Android
+    // viewport, while one-finger input remains remote Mac touch input.
+    private var viewportScale = 1f
+    private var viewportPanX = 0f
+    private var viewportPanY = 0f
+    private var localGestureActive = false
+    private var suppressRemoteUntilAllPointersUp = false
+    private var remotePointerActive = false
+    private var pinchStartDistance = 0f
+    private var pinchLastMidX = 0f
+    private var pinchLastMidY = 0f
+
+    // Display rotation from the Mac. Rotation requests recreate the host
+    // virtual display, so the client performs one reconnect after requesting it.
+    private var reconnectAfterDisplayChange = false
+    private var displayChangeReconnectJob: kotlinx.coroutines.Job? = null
+    private var lastUsbHost = "127.0.0.1"
+    private var lastUsbPort = 54321
 
     // Input prediction for low-latency gaming
     private val inputPredictor = InputPredictor()
@@ -77,6 +101,7 @@ class MainActivity : AppCompatActivity() {
 
         // Keep screen on
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        wakeAndShowOverLockScreen()
 
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -97,11 +122,64 @@ class MainActivity : AppCompatActivity() {
         setupUI()
         setupDraggableOverlay()
         setupSettingsButton()
+        setupRotateButton()
         restoreOverlayPosition()
         restoreSettingsButtonPosition()
         startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
+        handlePairingIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        wakeAndShowOverLockScreen()
+        enableFullscreenMode()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handlePairingIntent(intent)
+    }
+
+    private fun handlePairingIntent(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (launchGalaxyCameraIfNeeded(uri)) return
+
+        val pairingUrl = uri.toString()
+        if (PairingURL.parse(pairingUrl) == null) return
+
+        if (isConnected) {
+            disconnect()
+        }
+        prefs.connectionMode = ConnectionMode.WIRELESS
+        binding.modeToggleGroup.check(R.id.modeWireless)
+        applyModeVisibility(ConnectionMode.WIRELESS)
+        wirelessController.show()
+        wirelessController.onScanResult(pairingUrl)
+    }
+
+    private fun launchGalaxyCameraIfNeeded(uri: Uri): Boolean {
+        if (uri.scheme != "sidescreen") return false
+        if (uri.path?.trim('/') != "camera") return false
+        val host = uri.host?.takeIf { it.isNotBlank() } ?: return false
+        val port = uri.port.takeIf { it in 1..65535 } ?: 54323
+        startActivity(GalaxyCameraActivity.createIntent(this, host, port))
+        return true
+    }
+
+    private fun wakeAndShowOverLockScreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
     }
 
     private fun setupModeToggle() {
@@ -139,7 +217,6 @@ class MainActivity : AppCompatActivity() {
     private fun setupWirelessController() {
         wirelessController =
             WirelessTabController(
-                activity = this,
                 views =
                     WirelessTabController.Views(
                         connecting = binding.wirelessConnecting,
@@ -147,14 +224,12 @@ class MainActivity : AppCompatActivity() {
                         connected = binding.wirelessConnected,
                         pairedIdle = binding.wirelessPairedIdle,
                         repair = binding.wirelessTokenMismatch,
-                        permDenied = binding.wirelessPermDenied,
                         scanButton = binding.wirelessScanButton,
                         rescanButton = binding.wirelessRescanButton,
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
                         idleForgetButton = binding.wirelessIdleForgetButton,
-                        openSettingsButton = binding.wirelessOpenSettingsButton,
                         connectedMacName = binding.connectedMacName,
                         connectedMacIp = binding.connectedMacIp,
                         connectingLabel = binding.connectingLabel,
@@ -165,7 +240,6 @@ class MainActivity : AppCompatActivity() {
                         repairMessage = binding.repairMessage,
                     ),
                 storage = pairedHostStorage,
-                cameraPerm = cameraPerm,
                 onConnectRequested = { host, port, token, deviceName, macName ->
                     connectWireless(host, port, token, deviceName, macName)
                 },
@@ -174,30 +248,6 @@ class MainActivity : AppCompatActivity() {
         binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
         if (prefs.connectionMode == ConnectionMode.WIRELESS) {
             wirelessController.show()
-        }
-    }
-
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: android.content.Intent?,
-    ) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == WirelessTabController.REQ_SCAN && resultCode == RESULT_OK) {
-            val url = data?.getStringExtra(QRScannerActivity.EXTRA_URL) ?: return
-            wirelessController.onScanResult(url)
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == WirelessTabController.REQ_CAMERA) {
-            val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
-            wirelessController.onCameraPermissionResult(granted)
         }
     }
 
@@ -294,6 +344,7 @@ class MainActivity : AppCompatActivity() {
                     // from the server so we use the correct resolution.
                     // Store the holder so we can initialize later.
                     currentSurfaceHolder = holder
+                    applyViewportTransform()
                     // If we already have a display config (reconnect case), init now
                     if (displayWidth > 0 && displayHeight > 0 && videoDecoder == null) {
                         initializeDecoder(holder)
@@ -317,6 +368,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUI() {
+        binding.launchGalaxyCameraButton.setOnClickListener {
+            startActivity(Intent(this, GalaxyCameraActivity::class.java))
+        }
+
         binding.connectButton.setOnClickListener {
             var host =
                 binding.hostInput.text
@@ -642,6 +697,65 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun setupRotateButton() {
+        binding.rotateButton.setOnClickListener {
+            requestHostOrientationToggle()
+        }
+    }
+
+    private fun requestHostOrientationToggle() {
+        if (!isConnected) return
+
+        val nextRotation =
+            when (displayRotation) {
+                90, 270 -> 0
+                else -> 90
+            }
+        reconnectAfterDisplayChange = true
+        updateStatus("Rotating display...")
+        streamClient?.sendRotationRequest(nextRotation)
+        log("Rotation requested: ${if (nextRotation == 90) "Portrait" else "Landscape"}")
+    }
+
+    private fun scheduleReconnectAfterDisplayChange(mode: ConnectionMode) {
+        displayChangeReconnectJob?.cancel()
+        displayChangeReconnectJob =
+            lifecycleScope.launch(Dispatchers.IO) {
+                // The Mac recreates the virtual display after a rotation request.
+                // Waiting here avoids reconnecting to the listener while it is
+                // still being torn down, which can leave USB connected with no
+                // display config/video frames.
+                delay(6500)
+
+                repeat(3) { attempt ->
+                    if (isConnected && displayWidth > 0 && displayHeight > 0) return@launch
+
+                    runOnUiThread {
+                        if (isConnected && (displayWidth <= 0 || displayHeight <= 0)) {
+                            disconnect()
+                        }
+                        if (!isConnected) {
+                            updateStatus("Reconnecting after display change...")
+                            when (mode) {
+                                ConnectionMode.WIRELESS -> {
+                                    val entry = pairedHostStorage.load()
+                                    if (entry == null) {
+                                        wirelessController.show()
+                                    } else {
+                                        val deviceName = (Build.MODEL ?: "Android").take(64)
+                                        connectWireless(entry.host, entry.port, entry.token, deviceName, entry.macName)
+                                    }
+                                }
+                                ConnectionMode.USB -> connect(lastUsbHost, lastUsbPort)
+                            }
+                        }
+                    }
+
+                    delay(if (attempt == 0) 5000 else 3500)
+                }
+            }
+    }
+
     private fun restoreSettingsButtonPosition() {
         updateSettingsButtonPosition(prefs.settingsButtonCorner)
     }
@@ -811,6 +925,7 @@ class MainActivity : AppCompatActivity() {
                 dec.decode(frameData, frameSize, timestamp, isKeyframe)
             } else {
                 mainDiag("FRAME DROPPED: videoDecoder is null!")
+                streamClient?.releaseBuffer(frameData)
             }
         }
 
@@ -843,6 +958,7 @@ class MainActivity : AppCompatActivity() {
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
                     binding.settingsButton.visibility = View.VISIBLE
+                    binding.rotateButton.visibility = View.VISIBLE
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
                     // For wireless mode, transition controller to CONNECTED here —
@@ -862,8 +978,14 @@ class MainActivity : AppCompatActivity() {
                     resetOrientationToSensor()
                     binding.settingsPanel.visibility = View.VISIBLE
                     binding.settingsButton.visibility = View.GONE
+                    binding.rotateButton.visibility = View.GONE
                     binding.statusBar.visibility = View.GONE
+                    resetViewportTransform()
                     val mode = prefs.connectionMode
+                    if (reconnectAfterDisplayChange) {
+                        reconnectAfterDisplayChange = false
+                        scheduleReconnectAfterDisplayChange(mode)
+                    }
                     val willTransition = mode == ConnectionMode.WIRELESS
                     android.util.Log.i(
                         "MainActivity",
@@ -950,134 +1072,14 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        lastUsbHost = host
+        lastUsbPort = port
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
 
                 streamClient = StreamClient(host, port)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                    } else {
-                        streamClient?.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
-                }
-
-                // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
-                    }
-                }
-
-                streamClient?.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        // Update connection state flag
-                        isConnected = connected
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            binding.settingsButton.visibility = View.VISIBLE
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-                        }
-                    }
-                }
-
-                streamClient?.onDisplaySize = { width, height, rotation ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-
-                    if (videoDecoder != null) {
-                        // Decoder already exists — update its resolution
-                        videoDecoder?.updateResolution(width, height)
-                    } else {
-                        // Decoder not yet created — create it now with correct resolution
-                        val holder = currentSurfaceHolder
-                        if (holder != null && holder.surface.isValid) {
-                            mainDiag("Display config arrived, initializing decoder ${width}x$height")
-                            runOnUiThread {
-                                // Re-check under UI thread to prevent race with surfaceChanged
-                                if (videoDecoder == null) {
-                                    initializeDecoder(holder)
-                                }
-                            }
-                        } else {
-                            mainDiag("Display config arrived but no valid surface yet")
-                        }
-                    }
-
-                    runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
-                        // Apply rotation to SurfaceView
-                        applyRotation(rotation)
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
-                }
-
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                    }
-                }
-
+                setupStreamClientCallbacks()
                 streamClient?.connect()
             } catch (e: Exception) {
                 val errorMessage =
@@ -1157,51 +1159,166 @@ class MainActivity : AppCompatActivity() {
         view: View,
         event: MotionEvent,
     ) {
-        val x = event.x / view.width.toFloat()
-        val y = event.y / view.height.toFloat()
-        val pointerCount = event.pointerCount.coerceAtMost(2)
-
-        var x2 = 0f
-        var y2 = 0f
-        if (pointerCount >= 2) {
-            x2 = event.getX(1) / view.width.toFloat()
-            y2 = event.getY(1) / view.height.toFloat()
-        }
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                if (suppressRemoteUntilAllPointersUp) return
+                val (x, y) = mapTouchToDisplay(view, event, 0)
                 inputPredictor.reset()
                 inputPredictor.addSample(x, y)
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                streamClient?.sendTouch(x, y, 0, 1)
+                remotePointerActive = true
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                if (event.pointerCount >= 2) {
+                    if (remotePointerActive) {
+                        val (x, y) = mapTouchToDisplay(view, event, 0)
+                        streamClient?.sendTouch(x, y, 2, 1)
+                        remotePointerActive = false
+                    }
+                    inputPredictor.reset()
+                    beginLocalGesture(event)
+                }
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (pointerCount == 1) {
+                if (localGestureActive && event.pointerCount >= 2) {
+                    updateLocalGesture(view, event)
+                } else if (!suppressRemoteUntilAllPointersUp && event.pointerCount == 1) {
+                    val (x, y) = mapTouchToDisplay(view, event, 0)
                     inputPredictor.addSample(x, y)
                     val (px, py) = inputPredictor.predictPosition(12f)
                     streamClient?.sendTouch(px, py, 1, 1)
-                } else {
-                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2)
                 }
             }
 
             MotionEvent.ACTION_UP -> {
                 inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                if (localGestureActive || suppressRemoteUntilAllPointersUp) {
+                    endLocalGesture()
+                } else {
+                    val (x, y) = mapTouchToDisplay(view, event, 0)
+                    streamClient?.sendTouch(x, y, 2, 1)
+                }
+                remotePointerActive = false
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2)
+                if (localGestureActive) {
+                    suppressRemoteUntilAllPointersUp = true
+                    if (event.pointerCount <= 2) {
+                        localGestureActive = false
+                    }
+                }
             }
 
             MotionEvent.ACTION_CANCEL -> {
                 inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                if (remotePointerActive) {
+                    val (x, y) = mapTouchToDisplay(view, event, 0)
+                    streamClient?.sendTouch(x, y, 2, 1)
+                }
+                endLocalGesture()
+                remotePointerActive = false
             }
+        }
+    }
+
+    private fun beginLocalGesture(event: MotionEvent) {
+        localGestureActive = true
+        suppressRemoteUntilAllPointersUp = true
+        pinchStartDistance = distanceBetweenFirstTwoPointers(event).coerceAtLeast(1f)
+        val (midX, midY) = midpointOfFirstTwoPointers(event)
+        pinchLastMidX = midX
+        pinchLastMidY = midY
+    }
+
+    private fun updateLocalGesture(
+        view: View,
+        event: MotionEvent,
+    ) {
+        val distance = distanceBetweenFirstTwoPointers(event).coerceAtLeast(1f)
+        val (midX, midY) = midpointOfFirstTwoPointers(event)
+
+        val previousScale = viewportScale
+        val scaleFactor = distance / pinchStartDistance
+        val nextScale = (viewportScale * scaleFactor).coerceIn(MIN_VIEWPORT_SCALE, MAX_VIEWPORT_SCALE)
+
+        if (nextScale != previousScale) {
+            val ratio = nextScale / previousScale
+            viewportPanX = midX - (midX - viewportPanX) * ratio
+            viewportPanY = midY - (midY - viewportPanY) * ratio
+            viewportScale = nextScale
+        }
+
+        if (viewportScale > MIN_VIEWPORT_SCALE) {
+            viewportPanX += midX - pinchLastMidX
+            viewportPanY += midY - pinchLastMidY
+        }
+
+        pinchStartDistance = distance
+        pinchLastMidX = midX
+        pinchLastMidY = midY
+        clampViewportPan(view)
+        applyViewportTransform()
+    }
+
+    private fun endLocalGesture() {
+        localGestureActive = false
+        suppressRemoteUntilAllPointersUp = false
+        pinchStartDistance = 0f
+    }
+
+    private fun mapTouchToDisplay(
+        view: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+    ): Pair<Float, Float> {
+        val contentX = ((event.getX(pointerIndex) - viewportPanX) / viewportScale).coerceIn(0f, view.width.toFloat())
+        val contentY = ((event.getY(pointerIndex) - viewportPanY) / viewportScale).coerceIn(0f, view.height.toFloat())
+        return Pair(contentX / view.width.toFloat(), contentY / view.height.toFloat())
+    }
+
+    private fun distanceBetweenFirstTwoPointers(event: MotionEvent): Float {
+        return hypot(event.getX(1) - event.getX(0), event.getY(1) - event.getY(0))
+    }
+
+    private fun midpointOfFirstTwoPointers(event: MotionEvent): Pair<Float, Float> {
+        return Pair((event.getX(0) + event.getX(1)) / 2f, (event.getY(0) + event.getY(1)) / 2f)
+    }
+
+    private fun resetViewportTransform() {
+        viewportScale = MIN_VIEWPORT_SCALE
+        viewportPanX = 0f
+        viewportPanY = 0f
+        localGestureActive = false
+        suppressRemoteUntilAllPointersUp = false
+        remotePointerActive = false
+        applyViewportTransform()
+    }
+
+    private fun clampViewportPan(view: View = binding.surfaceView) {
+        if (viewportScale <= MIN_VIEWPORT_SCALE || view.width <= 0 || view.height <= 0) {
+            viewportScale = MIN_VIEWPORT_SCALE
+            viewportPanX = 0f
+            viewportPanY = 0f
+            return
+        }
+
+        val minPanX = view.width - view.width * viewportScale
+        val minPanY = view.height - view.height * viewportScale
+        viewportPanX = viewportPanX.coerceIn(minPanX, 0f)
+        viewportPanY = viewportPanY.coerceIn(minPanY, 0f)
+    }
+
+    private fun applyViewportTransform() {
+        binding.surfaceView.apply {
+            pivotX = 0f
+            pivotY = 0f
+            scaleX = viewportScale
+            scaleY = viewportScale
+            translationX = viewportPanX
+            translationY = viewportPanY
         }
     }
 
@@ -1218,12 +1335,7 @@ class MainActivity : AppCompatActivity() {
                 else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE // 0°
             }
 
-        // Reset SurfaceView transform (orientation change handles rotation)
-        binding.surfaceView.apply {
-            this.rotation = 0f
-            scaleX = 1f
-            scaleY = 1f
-        }
+        resetViewportTransform()
 
         // ConstraintSet handles orientation changes automatically
         // No need for postDelayed positioning
@@ -1311,7 +1423,7 @@ class MainActivity : AppCompatActivity() {
         val isUsbConnected = usbManager.deviceList.isNotEmpty() || isCharging()
         updateChecklistItem(binding.checkUsbConnected, isUsbConnected)
 
-        // Check Mac Server (try to connect to port)
+        // Check Mac Server without touching the single-client video stream.
         lifecycleScope.launch(Dispatchers.IO) {
             // Double-check connection state before socket test
             if (isConnected) return@launch
@@ -1320,7 +1432,7 @@ class MainActivity : AppCompatActivity() {
                 binding.portInput.text
                     .toString()
                     .toIntOrNull() ?: 54321
-            val isServerRunning = checkServerRunning("127.0.0.1", port)
+            val isServerRunning = checkServerRunning("127.0.0.1", healthPortFor(port))
             runOnUiThread {
                 // Final check before updating UI
                 if (isConnected) return@runOnUiThread
@@ -1367,14 +1479,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Check if Mac server is actually running (not just ADB reverse)
+     * Check if Mac server is actually running (not just ADB reverse) via the
+     * browser/health port. Never probe the video stream port here: the Mac
+     * stream server intentionally allows one native client, so a readiness
+     * probe on that port can kick off the real display session.
      *
      * Problem: When `adb reverse tcp:8888 tcp:8888` is active, ADB daemon listens on port 8888.
      * A simple socket connect will succeed to ADB daemon, not the actual Mac server.
      *
-     * Solution: After connecting, try to read data with a short timeout.
-     * Mac server sends display config (type=1) immediately upon connection.
-     * ADB daemon doesn't send anything, so read will timeout → false.
+     * Solution: Request /health on the HTTP browser server. ADB daemon doesn't
+     * send a valid HTTP response, so read will timeout or fail → false.
      */
     private fun checkServerRunning(
         host: String,
@@ -1384,16 +1498,21 @@ class MainActivity : AppCompatActivity() {
         return try {
             socket = Socket()
             socket.connect(InetSocketAddress(host, port), 300) // 300ms connect timeout
-            socket.soTimeout = 200 // 200ms read timeout
+            socket.soTimeout = 300 // 300ms read timeout
 
-            // Try to read - Mac server sends display config immediately
-            // ADB daemon doesn't send anything, so read will timeout
+            socket.getOutputStream().write(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                    .toByteArray(Charsets.US_ASCII),
+            )
+            socket.getOutputStream().flush()
+
             val input = socket.getInputStream()
-            val firstByte = input.read() // Blocks up to soTimeout
+            val buffer = ByteArray(96)
+            val read = input.read(buffer) // Blocks up to soTimeout
 
-            // If we got data (>= 0), it's the real Mac server
-            // -1 means EOF (connection closed), anything else is data
-            firstByte >= 0
+            if (read <= 0) return false
+            val response = String(buffer, 0, read, Charsets.US_ASCII)
+            response.startsWith("HTTP/1.1 200") || response.contains("\r\n\r\nok")
         } catch (e: Exception) {
             // Timeout, connection refused, or other error = server not running
             false
@@ -1405,4 +1524,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    private fun healthPortFor(streamPort: Int): Int = if (streamPort < 65535) streamPort + 1 else streamPort - 1
 }

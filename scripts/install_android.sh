@@ -4,6 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APK_PATH="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
+STREAM_PORT="${STREAM_PORT:-54321}"
+HEALTH_PORT="${HEALTH_PORT:-$((STREAM_PORT + 1))}"
+CAMERA_PORT="${CAMERA_PORT:-54323}"
 
 echo "📱 Installing Android app..."
 
@@ -27,10 +30,14 @@ echo ""
 echo "✅ App installed successfully!"
 echo ""
 echo "📲 Setting up USB port forwarding..."
-adb reverse --remove tcp:8888 2>/dev/null || true
-adb reverse tcp:8888 tcp:8888
+adb reverse --remove "tcp:$STREAM_PORT" 2>/dev/null || true
+adb reverse --remove "tcp:$HEALTH_PORT" 2>/dev/null || true
+adb reverse --remove "tcp:$CAMERA_PORT" 2>/dev/null || true
+adb reverse "tcp:$STREAM_PORT" "tcp:$STREAM_PORT"
+adb reverse "tcp:$HEALTH_PORT" "tcp:$HEALTH_PORT"
+adb reverse "tcp:$CAMERA_PORT" "tcp:$CAMERA_PORT"
 
-echo "✅ Port 8888 forwarded"
+echo "✅ Ports $STREAM_PORT, $HEALTH_PORT and $CAMERA_PORT forwarded"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Ready! Open 'Side Screen' on your Android device"

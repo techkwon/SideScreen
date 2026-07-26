@@ -1,23 +1,19 @@
 package com.sidescreen.app
 
-import android.app.Activity
-import android.content.Intent
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
 
 /**
- * Five-state UI machine for the Wireless tab on Android.
+ * Wireless tab state machine for the native Android client.
  *
- *   ① first-time → ② scanning (QRScannerActivity) → ③ connected
- *                                         ↘ ④ token mismatch / re-pair
- *   ⓹ permission denied permanently
+ * Wireless QR pairing is handled by the phone's Camera app opening the Mac-hosted
+ * browser client. The native app keeps cached wireless state for older pairings
+ * and remains the USB client.
  */
 class WirelessTabController(
-    private val activity: Activity,
     private val views: Views,
     private val storage: PairedHostStorage,
-    private val cameraPerm: CameraPermissionManager,
     private val onConnectRequested: (
         host: String,
         port: Int,
@@ -32,14 +28,12 @@ class WirelessTabController(
         val connected: View,
         val pairedIdle: View,
         val repair: View,
-        val permDenied: View,
         val scanButton: Button,
         val rescanButton: Button,
         val disconnectButton: Button,
         val forgetButton: Button,
         val reconnectButton: Button,
         val idleForgetButton: Button,
-        val openSettingsButton: Button,
         val connectedMacName: TextView,
         val connectedMacIp: TextView,
         val connectingLabel: TextView,
@@ -50,14 +44,13 @@ class WirelessTabController(
         val repairMessage: TextView,
     )
 
-    enum class State { FIRST_TIME, CONNECTING, CONNECTED, PAIRED_IDLE, REPAIR_NEEDED, PERM_DENIED }
+    enum class State { FIRST_TIME, CONNECTING, CONNECTED, PAIRED_IDLE, REPAIR_NEEDED }
 
     private var state: State = State.FIRST_TIME
 
     fun bind() {
-        views.scanButton.setOnClickListener { triggerScan() }
-        views.rescanButton.setOnClickListener { triggerScan() }
-        views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
+        views.scanButton.setOnClickListener { showBrowserQrInstruction() }
+        views.rescanButton.setOnClickListener { showBrowserQrInstruction() }
         views.forgetButton.setOnClickListener {
             storage.clear()
             transition(State.FIRST_TIME)
@@ -104,12 +97,11 @@ class WirelessTabController(
         views.connected.visibility = if (next == State.CONNECTED) View.VISIBLE else View.GONE
         views.pairedIdle.visibility = if (next == State.PAIRED_IDLE) View.VISIBLE else View.GONE
         views.repair.visibility = if (next == State.REPAIR_NEEDED) View.VISIBLE else View.GONE
-        views.permDenied.visibility = if (next == State.PERM_DENIED) View.VISIBLE else View.GONE
     }
 
     /**
      * Called when the Wireless tab becomes visible. Decides initial state based on
-     * cached host + camera permission state.
+     * cached host state.
      *
      * No auto-connect: even when a cached pairing exists, the user must press
      * the Reconnect button to actually start a connection. Auto-connect was
@@ -117,7 +109,6 @@ class WirelessTabController(
      */
     fun show() {
         when {
-            cameraPerm.isPermanentlyDenied() -> transition(State.PERM_DENIED)
             storage.load() == null -> transition(State.FIRST_TIME)
             else -> {
                 val entry = storage.load()!!
@@ -189,40 +180,15 @@ class WirelessTabController(
         transition(State.CONNECTED)
     }
 
-    fun onCameraPermissionResult(granted: Boolean) {
-        if (granted) {
-            // Re-evaluate; user just granted, jump straight into scanner.
-            launchScanner()
-        } else if (cameraPerm.isPermanentlyDenied()) {
-            transition(State.PERM_DENIED)
-        }
-        // else: stay in current state; user can tap Scan again to re-prompt.
-    }
-
-    private fun triggerScan() {
-        if (cameraPerm.isPermanentlyDenied()) {
-            transition(State.PERM_DENIED)
-            return
-        }
-        if (!cameraPerm.isGranted()) {
-            cameraPerm.request(REQ_CAMERA)
-            return
-        }
-        launchScanner()
-    }
-
-    private fun launchScanner() {
-        val intent = Intent(activity, QRScannerActivity::class.java)
-        activity.startActivityForResult(intent, REQ_SCAN)
+    private fun showBrowserQrInstruction() {
+        views.repairTitle.text = "Open QR with Camera"
+        views.repairMessage.text =
+            "Scan the Mac QR with the phone Camera app. The browser page can open this app for native wireless streaming, or stay in browser mode."
+        transition(State.REPAIR_NEEDED)
     }
 
     private fun attemptAutoConnect(entry: PairedHostStorage.Entry) {
         val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
         onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName)
-    }
-
-    companion object {
-        const val REQ_SCAN = 1001
-        const val REQ_CAMERA = 1002
     }
 }

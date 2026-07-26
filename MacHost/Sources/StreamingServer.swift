@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 private enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
@@ -10,6 +11,7 @@ private enum WireMessage {
     static let videoFrameWithMetadata: UInt8 = 6
     static let keyframeRequest: UInt8 = 7
     static let clientSupportsFrameMetadata: UInt8 = 8
+    static let displayRotationRequest: UInt8 = 9
 }
 
 private extension NWEndpoint {
@@ -38,6 +40,7 @@ class StreamingServer {
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
+    var onRotationRequested: ((Int) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
     // handled regardless. When false, incoming touch frames are dropped
     // immediately without parsing or dispatching to main queue.
@@ -52,18 +55,36 @@ class StreamingServer {
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
-    private var bytesSent: UInt64 = 0
-    private var frameCount: UInt64 = 0
-    private var droppedFrames: UInt64 = 0
-    private var lastStatsTime = DispatchTime.now()
+    // Frame-path flags. Written on networkQueue (connection lifecycle) and
+    // receiveQueue (capability handshake), read on the encoder callback thread
+    // for every frame — all three need to agree.
+    private struct SendState {
+        var connectionReady = false
+        var waitingForSyncFrame = false
+        var clientSupportsFrameMetadata = false
+        // Guards the one-shot startup path on its own, so `connectionReady` can
+        // stay false until the display config is actually on the wire.
+        var startupClaimed = false
+    }
+    private let sendLock = OSAllocatedUnfairLock(initialState: SendState())
+
+    // Stats counters. Incremented from the encoder thread and from send
+    // completion handlers on networkQueue, drained on frameQueue.
+    private struct StatsState {
+        var bytesSent: UInt64 = 0
+        var frameCount: UInt64 = 0
+        var droppedFrames: UInt64 = 0
+        var totalFrameAgeNs: UInt64 = 0
+        var profiledFrameCount: UInt64 = 0
+        var lastStatsTime = DispatchTime.now()
+    }
+    private let statsLock = OSAllocatedUnfairLock(initialState: StatsState())
+
     private var displayWidth = 1920
     private var displayHeight = 1080
     private var rotation = 0
     private var isReceiving = false
     private var isStopped = false
-    private var connectionReady = false
-    private var waitingForSyncFrame = false
-    private var clientSupportsFrameMetadata = false
     private var inputBuffer = Data()
 
     init(port: UInt16) {
@@ -114,12 +135,15 @@ class StreamingServer {
             oldConnection.cancel()
         }
 
-        connectionReady = false
-        clientSupportsFrameMetadata = false
-        waitingForSyncFrame = true
+        sendLock.withLock { state in
+            state.connectionReady = false
+            state.clientSupportsFrameMetadata = false
+            state.waitingForSyncFrame = true
+            state.startupClaimed = false
+        }
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
-        droppedFrames = 0
+        statsLock.withLock { $0.droppedFrames = 0 }
 
         connection?.stateUpdateHandler = { [weak self] state in
             debugLog("Connection state: \(state)")
@@ -168,12 +192,25 @@ class StreamingServer {
     }
 
     private func finishProtocolStartup(on conn: NWConnection) {
-        guard connection === conn, !isStopped, !connectionReady else { return }
+        guard connection === conn, !isStopped else { return }
+        // Claim startup atomically — the 100 ms fallback timer and the capability
+        // handshake both race to call this.
+        let alreadyStarted = sendLock.withLock { state -> Bool in
+            guard !state.startupClaimed else { return true }
+            state.startupClaimed = true
+            return false
+        }
+        guard !alreadyStarted else { return }
 
         debugLog("Client connected - sending display config first")
+        // Order matters: the client must have the display config before the first
+        // video frame, so the gate only opens once the config is queued.
         sendDisplaySize()
-        connectionReady = true
-        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"))")
+        let metadata = sendLock.withLock { state -> Bool in
+            state.connectionReady = true
+            return state.clientSupportsFrameMetadata
+        }
+        debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"))")
         onClientConnected?()
     }
 
@@ -362,11 +399,33 @@ class StreamingServer {
                 // One-byte opt-in from newer clients. Keeping this payload-free
                 // lets older hosts safely ignore it without misaligning input.
                 consumeInputBytes(1)
-                if !clientSupportsFrameMetadata {
-                    clientSupportsFrameMetadata = true
+                let wasAdvertised = sendLock.withLock { state -> Bool in
+                    let previous = state.clientSupportsFrameMetadata
+                    state.clientSupportsFrameMetadata = true
+                    return previous
+                }
+                if !wasAdvertised {
                     debugLog("Client supports video frame metadata")
                 }
                 finishProtocolStartup(on: connection)
+
+            case WireMessage.displayRotationRequest:
+                // Android client rotation request: type + Int32 little-endian degrees.
+                guard inputBuffer.count >= 5 else { return }
+
+                let requested = inputBuffer.withUnsafeBytes {
+                    Int($0.loadUnaligned(fromByteOffset: 1, as: Int32.self))
+                }
+                consumeInputBytes(5)
+
+                guard [0, 90, 180, 270].contains(requested) else {
+                    debugLog("Invalid display rotation requested: \(requested)")
+                    continue
+                }
+                debugLog("Display rotation requested by client: \(requested)°")
+                DispatchQueue.main.async {
+                    self.onRotationRequested?(requested)
+                }
 
             default:
                 debugLog("Unknown client input type: \(msgType)")
@@ -403,97 +462,156 @@ class StreamingServer {
         inputBuffer.removeSubrange(inputBuffer.startIndex..<endIndex)
     }
 
-    func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        guard let connection = connection, !isStopped, connectionReady else { return }
+    private enum FrameGate {
+        case notReady
+        case awaitingKeyframe
+        case send(useMetadata: Bool, isFirstKeyframe: Bool)
+    }
+
+    /// Takes the encoded frame `inout` because the wire header is patched directly
+    /// into the scratch room `VideoEncoder` reserved at the front. Passing by value
+    /// would leave the buffer multiply-referenced and turn that patch into a
+    /// full copy-on-write duplication of every frame.
+    func sendFrame(_ data: inout Data, timestamp: UInt64, isKeyframe: Bool = false) {
+        guard let connection = connection, !isStopped else { return }
 
         // With short-GOP encoding, a fresh client must start on a keyframe —
         // sending P-frames before the first IDR would feed garbage to its decoder.
-        if waitingForSyncFrame {
-            guard isKeyframe else {
-                droppedFrames += 1
-                return
+        let gate: FrameGate = sendLock.withLock { state in
+            guard state.connectionReady else { return .notReady }
+            guard state.waitingForSyncFrame else {
+                return .send(useMetadata: state.clientSupportsFrameMetadata, isFirstKeyframe: false)
             }
-            waitingForSyncFrame = false
-            debugLog("First keyframe sent to new client")
+            guard isKeyframe else { return .awaitingKeyframe }
+            state.waitingForSyncFrame = false
+            return .send(useMetadata: state.clientSupportsFrameMetadata, isFirstKeyframe: true)
         }
+
+        let useMetadata: Bool
+        switch gate {
+        case .notReady:
+            return
+        case .awaitingKeyframe:
+            statsLock.withLock { $0.droppedFrames += 1 }
+            return
+        case let .send(metadata, isFirstKeyframe):
+            if isFirstKeyframe { debugLog("First keyframe sent to new client") }
+            useMetadata = metadata
+        }
+
+        let payloadCount = data.count - VideoEncoder.headerRoom
+        let packet = makeFramePacket(&data, timestamp: timestamp, isKeyframe: isKeyframe, useMetadata: useMetadata)
 
         // No frame-age dropping or backpressure — send everything immediately.
         // The encode queue depth limit (2 pending) in ScreenCapture handles flow control.
         frameQueue.async { [weak self] in
             guard let self = self else { return }
 
-            let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
-
-            connection.send(content: packet, completion: .contentProcessed { error in
+            connection.send(content: packet, completion: .contentProcessed { [weak self] error in
                 if error != nil {
-                    self.droppedFrames += 1
+                    self?.statsLock.withLock { $0.droppedFrames += 1 }
                 }
             })
 
             // Track frame age at send time for pipeline profiling
             let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
-            self.updateStats(bytes: data.count, frameAgeNs: sendAge)
+            self.updateStats(bytes: payloadCount, frameAgeNs: sendAge)
         }
     }
 
-    private func makeFramePacket(_ data: Data, timestamp: UInt64, isKeyframe: Bool) -> Data {
-        if clientSupportsFrameMetadata {
-            var packet = Data(capacity: data.count + 14)
-            packet.append(WireMessage.videoFrameWithMetadata)
-            appendFrameSize(data.count, to: &packet)
-            packet.append(isKeyframe ? 1 : 0)
-            var captureTimestamp = timestamp.bigEndian
-            withUnsafeBytes(of: &captureTimestamp) { packet.append(contentsOf: $0) }
-            packet.append(data)
-            return packet
+    /// Writes the wire header into the scratch room at the front of `data` and
+    /// returns the slice to put on the wire. No payload bytes are moved.
+    private func makeFramePacket(
+        _ data: inout Data,
+        timestamp: UInt64,
+        isKeyframe: Bool,
+        useMetadata: Bool
+    ) -> Data {
+        let room = VideoEncoder.headerRoom
+        let payloadCount = UInt32(truncatingIfNeeded: data.count - room)
+
+        if useMetadata {
+            // [type 1][size 4][keyframe 1][capture timestamp 8] fills the room exactly.
+            data.withUnsafeMutableBytes { raw in
+                raw[0] = WireMessage.videoFrameWithMetadata
+                Self.writeBigEndian(payloadCount, to: raw, at: 1)
+                raw[5] = isKeyframe ? 1 : 0
+                Self.writeBigEndian(timestamp, to: raw, at: 6)
+            }
+            return data
         }
 
-        // Keep legacy frame type 0 for clients that do not advertise
-        // metadata support; remove after legacy clients age out.
-        var packet = Data(capacity: data.count + 5)
-        packet.append(WireMessage.legacyVideoFrame)
-        appendFrameSize(data.count, to: &packet)
-        packet.append(data)
-        return packet
+        // Keep legacy frame type 0 for clients that do not advertise metadata
+        // support; remove after legacy clients age out. Its shorter header goes at
+        // the tail of the room so the unused leading bytes can be sliced off.
+        let offset = room - 5
+        data.withUnsafeMutableBytes { raw in
+            raw[offset] = WireMessage.legacyVideoFrame
+            Self.writeBigEndian(payloadCount, to: raw, at: offset + 1)
+        }
+        return data[(data.startIndex + offset)...]
     }
 
-    private func appendFrameSize(_ size: Int, to packet: inout Data) {
-        var frameSize = Int32(size).bigEndian
-        withUnsafeBytes(of: &frameSize) { packet.append(contentsOf: $0) }
+    // Byte-wise so the writes stay valid at unaligned offsets inside the header room.
+    private static func writeBigEndian(_ value: UInt32, to raw: UnsafeMutableRawBufferPointer, at offset: Int) {
+        raw[offset] = UInt8(truncatingIfNeeded: value >> 24)
+        raw[offset + 1] = UInt8(truncatingIfNeeded: value >> 16)
+        raw[offset + 2] = UInt8(truncatingIfNeeded: value >> 8)
+        raw[offset + 3] = UInt8(truncatingIfNeeded: value)
     }
 
-    // Pipeline profiling: track frame age at send time
-    private var totalFrameAgeNs: UInt64 = 0
-    private var profiledFrameCount: UInt64 = 0
+    private static func writeBigEndian(_ value: UInt64, to raw: UnsafeMutableRawBufferPointer, at offset: Int) {
+        for index in 0..<8 {
+            raw[offset + index] = UInt8(truncatingIfNeeded: value >> (56 - 8 * index))
+        }
+    }
+
+    private struct StatsSnapshot {
+        let fps: Double
+        let mbps: Double
+        let avgAgeMs: Double?
+        let dropped: UInt64
+    }
 
     private func updateStats(bytes: Int, frameAgeNs: UInt64 = 0) {
-        bytesSent += UInt64(bytes)
-        frameCount += 1
-        if frameAgeNs > 0 {
-            totalFrameAgeNs += frameAgeNs
-            profiledFrameCount += 1
-        }
-
         let now = DispatchTime.now()
-        let elapsed = Double(now.uptimeNanoseconds - lastStatsTime.uptimeNanoseconds) / 1_000_000_000
 
-        if elapsed >= 1.0 {
-            let mbps = Double(bytesSent * 8) / elapsed / 1_000_000
-            let fps = Double(frameCount) / elapsed
-            onStats?(fps, mbps)
-
-            // Log pipeline latency profile
-            if profiledFrameCount > 0 {
-                let avgAgeMs = Double(totalFrameAgeNs) / Double(profiledFrameCount) / 1_000_000.0
-                debugLog("Pipeline: \(String(format: "%.1f", fps))fps, \(String(format: "%.1f", mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(droppedFrames)")
+        let snapshot: StatsSnapshot? = statsLock.withLock { state in
+            state.bytesSent += UInt64(bytes)
+            state.frameCount += 1
+            if frameAgeNs > 0 {
+                state.totalFrameAgeNs += frameAgeNs
+                state.profiledFrameCount += 1
             }
 
-            bytesSent = 0
-            frameCount = 0
-            droppedFrames = 0
-            totalFrameAgeNs = 0
-            profiledFrameCount = 0
-            lastStatsTime = now
+            let elapsed = Double(now.uptimeNanoseconds - state.lastStatsTime.uptimeNanoseconds) / 1_000_000_000
+            guard elapsed >= 1.0 else { return nil }
+
+            let snapshot = StatsSnapshot(
+                fps: Double(state.frameCount) / elapsed,
+                mbps: Double(state.bytesSent * 8) / elapsed / 1_000_000,
+                avgAgeMs: state.profiledFrameCount > 0
+                    ? Double(state.totalFrameAgeNs) / Double(state.profiledFrameCount) / 1_000_000.0
+                    : nil,
+                dropped: state.droppedFrames
+            )
+
+            state.bytesSent = 0
+            state.frameCount = 0
+            state.droppedFrames = 0
+            state.totalFrameAgeNs = 0
+            state.profiledFrameCount = 0
+            state.lastStatsTime = now
+            return snapshot
+        }
+
+        // Publish outside the lock — onStats hops to the UI and must not block the frame path.
+        guard let snapshot else { return }
+        onStats?(snapshot.fps, snapshot.mbps)
+
+        // Log pipeline latency profile
+        if let avgAgeMs = snapshot.avgAgeMs {
+            debugLog("Pipeline: \(String(format: "%.1f", snapshot.fps))fps, \(String(format: "%.1f", snapshot.mbps))Mbps, avg frame age: \(String(format: "%.1f", avgAgeMs))ms, dropped: \(snapshot.dropped)")
         }
     }
 
