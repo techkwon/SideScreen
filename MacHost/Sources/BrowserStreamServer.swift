@@ -11,6 +11,17 @@ final class BrowserStreamServer {
     /// forever; with per-client backpressure below, a weak link now sheds frames on
     /// its own and the cap can sit much closer to the native path.
     private static let targetFrameIntervalNanos: UInt64 = 33_000_000  // ~30 fps
+    /// Slowest the stream will pace itself to before giving up on smoothness (~5 fps).
+    /// A link that cannot carry the target gets fewer but evenly spaced frames, which
+    /// reads far better than 30 fps worth of frames shed at random.
+    private static let maxFrameIntervalNanos: UInt64 = 200_000_000
+    /// Recovery is geometric, not additive: an additive creep took over ten seconds
+    /// to return to full rate after a single hiccup, so the stream spent most of a
+    /// congested session crawling. Backoff is still steeper than recovery.
+    private static let pacingBackoffNumerator: UInt64 = 3
+    private static let pacingBackoffDenominator: UInt64 = 2
+    private static let pacingRecoveryNumerator: UInt64 = 9
+    private static let pacingRecoveryDenominator: UInt64 = 10
     /// Chunks allowed outstanding on one connection before it starts getting
     /// skipped. NWConnection buffers without bound, so without this a client on bad
     /// WiFi accumulates ever-growing latency instead of dropping frames.
@@ -28,6 +39,7 @@ final class BrowserStreamServer {
     private struct DemandState {
         var clientCount = 0
         var lastStillRequestNanos: UInt64 = 0
+        var frameIntervalNanos = BrowserStreamServer.targetFrameIntervalNanos
     }
 
     private let port: UInt16
@@ -100,12 +112,15 @@ final class BrowserStreamServer {
 
         // Nobody is watching: skip the whole JPEG pipeline. A USB-only session never
         // opens a browser client, and encoding for an empty broadcast is pure waste.
-        let wanted = demandState.withLock { state in
-            state.clientCount > 0 || now &- state.lastStillRequestNanos < Self.stillRequestWindowNanos
+        let (wanted, interval) = demandState.withLock { state in
+            (
+                state.clientCount > 0 || now &- state.lastStillRequestNanos < Self.stillRequestWindowNanos,
+                state.frameIntervalNanos
+            )
         }
         guard wanted else { return }
 
-        guard now &- lastJPEGNanos >= Self.targetFrameIntervalNanos else { return }
+        guard now &- lastJPEGNanos >= interval else { return }
         lastJPEGNanos = now
 
         let retainedPixelBuffer = RetainedPixelBuffer(pixelBuffer)
@@ -160,11 +175,21 @@ final class BrowserStreamServer {
                 if let data {
                     buffer.append(data)
                 }
-                if buffer.range(of: Data("\r\n\r\n".utf8)) != nil {
-                    self.route(connection, requestData: buffer)
-                } else if buffer.count > 8192 {
-                    self.sendText("Bad Request", status: "400 Bad Request", on: connection)
-                } else {
+
+                guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+                    if buffer.count > 8192 {
+                        self.sendText("Bad Request", status: "400 Bad Request", on: connection)
+                    } else {
+                        receiveMore()
+                    }
+                    return
+                }
+
+                // Consume just this request so anything pipelined behind it survives.
+                let requestData = Data(buffer[buffer.startIndex..<headerEnd.upperBound])
+                buffer.removeSubrange(buffer.startIndex..<headerEnd.upperBound)
+
+                if case .keepAlive = self.route(connection, requestData: requestData) {
                     receiveMore()
                 }
             }
@@ -173,17 +198,27 @@ final class BrowserStreamServer {
         receiveMore()
     }
 
-    private func route(_ connection: NWConnection, requestData: Data) {
+    /// What the connection should do once a request has been answered.
+    private enum Disposition {
+        /// The responder closes the socket.
+        case close
+        /// Stay open for the next request on the same connection.
+        case keepAlive
+        /// Handed over to the MJPEG broadcaster; no further requests expected.
+        case stream
+    }
+
+    private func route(_ connection: NWConnection, requestData: Data) -> Disposition {
         guard let request = String(data: requestData, encoding: .utf8),
               let firstLine = request.split(separator: "\n", maxSplits: 1).first else {
             sendText("Bad Request", status: "400 Bad Request", on: connection)
-            return
+            return .close
         }
 
         let parts = firstLine.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ")
         guard parts.count >= 2 else {
             sendText("Bad Request", status: "400 Bad Request", on: connection)
-            return
+            return .close
         }
 
         let method = String(parts[0])
@@ -193,26 +228,28 @@ final class BrowserStreamServer {
 
         guard method == "GET" else {
             sendText("Method Not Allowed", status: "405 Method Not Allowed", on: connection)
-            return
+            return .close
         }
 
         switch path {
         case "/":
             guard isAuthorized(components) else {
                 sendText("Pairing token required.", status: "403 Forbidden", on: connection)
-                return
+                return .close
             }
             sendHTML(token: tokenQueryValue(components) ?? "", on: connection)
+            return .close
         case "/stream.mjpg":
             guard isAuthorized(components) else {
                 sendText("Pairing token required.", status: "403 Forbidden", on: connection)
-                return
+                return .close
             }
             startMJPEG(on: connection)
+            return .stream
         case "/latest.jpg":
             guard isAuthorized(components) else {
                 sendText("Pairing token required.", status: "403 Forbidden", on: connection)
-                return
+                return .close
             }
             // This endpoint holds no connection, so record the interest explicitly —
             // otherwise the encoder stays idle and the cached frame never refreshes.
@@ -220,20 +257,27 @@ final class BrowserStreamServer {
             demandState.withLock { $0.lastStillRequestNanos = now }
             guard let latestJPEG else {
                 sendText("No frame yet.", status: "404 Not Found", on: connection)
-                return
+                return .close
             }
             sendBytes(latestJPEG, contentType: "image/jpeg", on: connection)
+            return .close
         case "/touch":
             guard isAuthorized(components) else {
                 sendText("Pairing token required.", status: "403 Forbidden", on: connection)
-                return
+                return .close
             }
             handleTouch(components)
-            sendText("", status: "204 No Content", on: connection)
+            // The viewer fires one request per pointer move. Closing here forced a new
+            // TCP handshake for every single one, so the coordinate could not reach the
+            // Mac in under a round trip. Holding the connection open removes that floor.
+            sendText("", status: "204 No Content", keepAlive: true, on: connection)
+            return .keepAlive
         case "/health":
             sendText("ok", contentType: "text/plain; charset=utf-8", on: connection)
+            return .close
         default:
             sendText("Not Found", status: "404 Not Found", on: connection)
+            return .close
         }
     }
 
@@ -376,8 +420,37 @@ final class BrowserStreamServer {
     }
 
     private func broadcast(_ jpeg: Data) {
-        for (id, client) in clients where client.inFlight < Self.maxInFlightChunks {
+        var served = 0
+        var skipped = 0
+        for (id, client) in clients {
+            guard client.inFlight < Self.maxInFlightChunks else {
+                skipped += 1
+                continue
+            }
             sendJPEGChunk(jpeg, toClientWith: id)
+            served += 1
+        }
+        // Only slow the encode when nobody could take the frame. Backing off because
+        // *any* client is behind would let one bad link drag every other viewer down,
+        // and per-client skipping already handles the stragglers.
+        adaptPacing(backlogged: served == 0 && skipped > 0)
+    }
+
+    /// AIMD on the frame interval, driven by the same in-flight signal that decides
+    /// whether to skip a client. Backing off multiplicatively and recovering slowly
+    /// keeps the stream at whatever rate the link actually drains, so frames arrive
+    /// evenly instead of being produced at 30 fps and discarded at random.
+    private func adaptPacing(backlogged: Bool) {
+        demandState.withLock { state in
+            if backlogged {
+                let widened = state.frameIntervalNanos
+                    * Self.pacingBackoffNumerator / Self.pacingBackoffDenominator
+                state.frameIntervalNanos = min(widened, Self.maxFrameIntervalNanos)
+            } else {
+                let narrowed = state.frameIntervalNanos
+                    * Self.pacingRecoveryNumerator / Self.pacingRecoveryDenominator
+                state.frameIntervalNanos = max(narrowed, Self.targetFrameIntervalNanos)
+            }
         }
     }
 
@@ -421,6 +494,7 @@ final class BrowserStreamServer {
         _ text: String,
         status: String = "200 OK",
         contentType: String = "text/plain; charset=utf-8",
+        keepAlive: Bool = false,
         on connection: NWConnection
     ) {
         let data = Data(text.utf8)
@@ -429,14 +503,16 @@ final class BrowserStreamServer {
         Content-Type: \(contentType)\r
         Content-Length: \(data.count)\r
         Cache-Control: no-store\r
-        Connection: close\r
+        Connection: \(keepAlive ? "keep-alive" : "close")\r
         \r
 
         """
         var response = Data(header.utf8)
         response.append(data)
         connection.send(content: response, completion: .contentProcessed { _ in
-            connection.cancel()
+            if !keepAlive {
+                connection.cancel()
+            }
         })
     }
 
