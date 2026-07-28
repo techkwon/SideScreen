@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.hardware.SensorManager
 import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
@@ -15,8 +16,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.MotionEvent
+import android.view.OrientationEventListener
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.Window
@@ -90,6 +93,16 @@ class MainActivity : AppCompatActivity() {
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
+    // Sensor-driven rotation
+    private var orientationListener: OrientationEventListener? = null
+    private var candidateRotation: Int? = null
+    private var candidateSince = 0L
+
+    // Idle auto-hide for the floating controls
+    private val buttonHideHandler = Handler(Looper.getMainLooper())
+    private val hideFloatingButtons = Runnable { setFloatingButtonsVisible(false, animated = true) }
+    private var floatingButtonsVisible = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -123,6 +136,7 @@ class MainActivity : AppCompatActivity() {
         setupDraggableOverlay()
         setupSettingsButton()
         setupRotateButton()
+        setupOrientationListener()
         restoreOverlayPosition()
         restoreSettingsButtonPosition()
         startChecklistUpdates()
@@ -362,6 +376,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         binding.surfaceView.setOnTouchListener { view, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) noteUserInteraction()
             handleTouch(view, event)
             true
         }
@@ -533,6 +548,8 @@ class MainActivity : AppCompatActivity() {
 
         val view = dialog.findViewById<View>(android.R.id.content)
         val showStatsSwitch = view.findViewById<SwitchMaterial>(R.id.showStatsSwitch)
+        val autoRotateSwitch = view.findViewById<SwitchMaterial>(R.id.autoRotateSwitch)
+        val autoHideButtonsSwitch = view.findViewById<SwitchMaterial>(R.id.autoHideButtonsSwitch)
         val opacitySlider = view.findViewById<Slider>(R.id.opacitySlider)
         val opacityValue = view.findViewById<TextView>(R.id.opacityValue)
         val resetButton = view.findViewById<View>(R.id.resetPositionButton)
@@ -556,6 +573,18 @@ class MainActivity : AppCompatActivity() {
 
         // Load current settings
         showStatsSwitch.isChecked = prefs.showStatsOverlay
+        autoRotateSwitch.isChecked = prefs.autoRotate
+        autoHideButtonsSwitch.isChecked = prefs.autoHideButtons
+
+        autoRotateSwitch.setOnCheckedChangeListener { _, checked ->
+            prefs.autoRotate = checked
+            updateOrientationListenerState()
+        }
+        autoHideButtonsSwitch.setOnCheckedChangeListener { _, checked ->
+            prefs.autoHideButtons = checked
+            // Re-arm or cancel the countdown immediately so the switch feels live.
+            noteUserInteraction()
+        }
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
 
@@ -704,17 +733,133 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestHostOrientationToggle() {
-        if (!isConnected) return
-
         val nextRotation =
             when (displayRotation) {
                 90, 270 -> 0
                 else -> 90
             }
+        requestHostRotation(nextRotation, reason = "button")
+    }
+
+    /**
+     * Ask the Mac to rotate the virtual display.
+     *
+     * The host destroys and recreates the display for this, so the client drops and
+     * reconnects afterwards — several seconds of black screen. Every caller funnels
+     * through here so that cost is paid at most once per actual orientation change.
+     */
+    private fun requestHostRotation(
+        rotation: Int,
+        reason: String,
+    ) {
+        if (!isConnected) return
+        if (rotation == displayRotation) return
+        if (reconnectAfterDisplayChange) {
+            mainDiag("Rotation to $rotation ignored ($reason) — a display change is already in flight")
+            return
+        }
         reconnectAfterDisplayChange = true
         updateStatus("Rotating display...")
-        streamClient?.sendRotationRequest(nextRotation)
-        log("Rotation requested: ${if (nextRotation == 90) "Portrait" else "Landscape"}")
+        streamClient?.sendRotationRequest(rotation)
+        log("Rotation requested ($reason): ${if (rotation == 90) "Portrait" else "Landscape"}")
+    }
+
+    /**
+     * Watches the physical device angle and mirrors it onto the host display.
+     *
+     * The activity locks its own orientation while streaming, so the usual
+     * configuration-change route never fires; OrientationEventListener reports the
+     * raw sensor angle regardless of that lock. A candidate orientation has to hold
+     * still for [ORIENTATION_SETTLE_MS] before it counts, because the host pays a
+     * full display rebuild per change and a wobble must not trigger one.
+     */
+    private fun setupOrientationListener() {
+        orientationListener =
+            object : OrientationEventListener(this, SensorManager.SENSOR_DELAY_NORMAL) {
+                override fun onOrientationChanged(degrees: Int) {
+                    if (degrees == ORIENTATION_UNKNOWN) return
+                    if (!prefs.autoRotate || !isConnected) {
+                        candidateRotation = null
+                        return
+                    }
+
+                    // Collapse the angle to the two orientations the host supports,
+                    // ignoring the ±30° band around each boundary so a tablet held
+                    // near 45° does not flip-flop.
+                    val target =
+                        when {
+                            degrees >= 330 || degrees < 30 -> 90 // upright
+                            degrees in 60..119 -> 0 // rotated left
+                            degrees in 150..209 -> 90 // upside down, still portrait
+                            degrees in 240..299 -> 0 // rotated right
+                            else -> return
+                        }
+
+                    if (target == displayRotation) {
+                        candidateRotation = null
+                        return
+                    }
+                    val now = SystemClock.elapsedRealtime()
+                    if (candidateRotation != target) {
+                        candidateRotation = target
+                        candidateSince = now
+                        return
+                    }
+                    if (now - candidateSince < ORIENTATION_SETTLE_MS) return
+
+                    candidateRotation = null
+                    requestHostRotation(target, reason = "sensor")
+                }
+            }
+    }
+
+    private fun updateOrientationListenerState() {
+        val listener = orientationListener ?: return
+        if (prefs.autoRotate && isConnected && listener.canDetectOrientation()) {
+            listener.enable()
+        } else {
+            listener.disable()
+            candidateRotation = null
+        }
+    }
+
+    /**
+     * Fade the floating controls out when they are not being used. They sit on top of
+     * the stream, so leaving them up permanently costs picture area for no benefit.
+     * Hidden buttons go INVISIBLE rather than merely transparent, so taps in that area
+     * reach the stream underneath instead of hitting an invisible target.
+     */
+    private fun setFloatingButtonsVisible(
+        visible: Boolean,
+        animated: Boolean,
+    ) {
+        if (floatingButtonsVisible == visible) return
+        floatingButtonsVisible = visible
+        val buttons = listOf(binding.settingsButton, binding.rotateButton)
+        buttons.forEach { button ->
+            if (!animated) {
+                button.alpha = if (visible) 1f else 0f
+                button.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+                return@forEach
+            }
+            if (visible) {
+                button.visibility = View.VISIBLE
+                button.animate().alpha(1f).setDuration(BUTTON_FADE_MS).start()
+            } else {
+                button.animate().alpha(0f).setDuration(BUTTON_FADE_MS)
+                    .withEndAction { button.visibility = View.INVISIBLE }
+                    .start()
+            }
+        }
+    }
+
+    /** Reveal the controls and restart the idle countdown. */
+    private fun noteUserInteraction() {
+        buttonHideHandler.removeCallbacks(hideFloatingButtons)
+        setFloatingButtonsVisible(true, animated = true)
+        if (prefs.autoHideButtons) {
+            buttonHideHandler.postDelayed(hideFloatingButtons, BUTTON_IDLE_TIMEOUT_MS)
+        }
     }
 
     private fun scheduleReconnectAfterDisplayChange(mode: ConnectionMode) {
@@ -942,10 +1087,16 @@ class MainActivity : AppCompatActivity() {
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
+                updateOrientationListenerState()
                 if (connected) {
                     updateStatus("Connected - Streaming active")
+                    // Start the idle countdown so the controls clear the picture once
+                    // the user stops interacting.
+                    noteUserInteraction()
                 } else {
                     updateStatus("Disconnected")
+                    buttonHideHandler.removeCallbacks(hideFloatingButtons)
+                    setFloatingButtonsVisible(true, animated = false)
                 }
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
@@ -1368,6 +1519,8 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopChecklistUpdates()
+        orientationListener?.disable()
+        buttonHideHandler.removeCallbacks(hideFloatingButtons)
         cleanup()
     }
 
@@ -1526,4 +1679,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun healthPortFor(streamPort: Int): Int = if (streamPort < 65535) streamPort + 1 else streamPort - 1
+
+    companion object {
+        /** How long a new orientation must hold before the host is asked to rotate. */
+        private const val ORIENTATION_SETTLE_MS = 1_500L
+
+        /** Idle time before the floating controls fade away. */
+        private const val BUTTON_IDLE_TIMEOUT_MS = 4_000L
+        private const val BUTTON_FADE_MS = 250L
+    }
 }

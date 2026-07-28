@@ -217,7 +217,11 @@ class ScreenCapture {
         let (width, height) = ScreenCapture.physicalSize(for: virtualDisplayID)
         let fps = refreshRate
 
-        streamOutput = StreamOutput()
+        // Hold a local reference. The property is cleared by the restart, fallback and
+        // stop paths, so force-unwrapping it further down races with any of them and
+        // crashes setup outright — which is what "Unexpectedly found nil" here was.
+        let output = StreamOutput()
+        streamOutput = output
 
         let delegate = StreamDelegate()
         delegate.onStreamError = { [weak self] _ in
@@ -244,7 +248,7 @@ class ScreenCapture {
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
 
         stream = scStream
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")

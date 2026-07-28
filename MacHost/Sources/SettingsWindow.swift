@@ -1268,6 +1268,12 @@ class DisplaySettings: ObservableObject {
         ResolutionGroup(name: "5:3", ratio: "Tablet Wide", resolutions: [
             "2000x1200", "2560x1536", "2800x1680"
         ]),
+        // Portrait counterparts. Android tablets are routinely used upright, and the
+        // list previously offered landscape only, forcing a custom size every time.
+        ResolutionGroup(name: "Portrait", ratio: "Tablet Upright", resolutions: [
+            "800x1280", "900x1440", "1050x1680", "1200x1920", "1536x2048",
+            "1600x2560", "1668x2224", "1668x2388", "1856x2160", "1968x2184", "2048x2732"
+        ]),
         ResolutionGroup(name: "4:3", ratio: "iPad", resolutions: [
             "2048x1536", "2224x1668", "2388x1668", "2732x2048"
         ])
@@ -1435,17 +1441,8 @@ class ConstrainedWindow: NSWindow {
 struct WirelessSection: View {
     @ObservedObject var settings: DisplaySettings
     let pairedDeviceStore: PairedDeviceStore
-    /// Which client the QR is meant for. The browser viewer lives on the web port
-    /// and speaks http; the native Android client pairs over the stream port with a
-    /// `sidescreen://` deep link and rejects anything else, so one QR cannot serve
-    /// both. Offer the choice instead of silently locking out the native app.
-    enum QRTarget: String, CaseIterable {
-        case browser = "Browser"
-        case app = "Android app"
-    }
-
     @State private var qrImage: NSImage?
-    @State private var qrTarget: QRTarget = .browser
+    @State private var qrURLText: String = ""
     @State private var pairedDevices: [PairedDevice] = []
     @State private var showResetConfirm = false
     /// Used to force the relative-time labels to recompute every tick even when
@@ -1470,13 +1467,6 @@ struct WirelessSection: View {
             }
             FrostedGroupBox(title: "Pair Device", icon: "qrcode") {
                 VStack(spacing: 8) {
-                    Picker("", selection: $qrTarget) {
-                        ForEach(QRTarget.allCases, id: \.self) { target in
-                            Text(target.rawValue).tag(target)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
                     if let qr = qrImage {
                         Image(nsImage: qr)
                             .interpolation(.none)
@@ -1489,17 +1479,21 @@ struct WirelessSection: View {
                     } else {
                         Text("Generating QR…").foregroundColor(.secondary)
                     }
-                    Text(qrTarget == .browser
-                         ? "Scan with the Android camera to open in a browser"
-                         : "Scan from the app's Wireless tab (or the camera) to pair the native H.265 client")
+                    Text("Scan from the Side Screen app's Wireless tab to pair the H.265 client")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map {
-                        qrTarget == .browser
-                            ? "Browser: \($0):\(BrowserStreamServer.webPort(for: settings.port))"
-                            : "App: \($0):\(settings.port)"
-                    } ?? "WiFi disconnected — no LAN address")
+                    // Show what the QR actually encodes. Without this the only clue to
+                    // which client the QR is for was the port, which is easy to miss.
+                    Text(qrURLText.isEmpty ? "WiFi disconnected — no LAN address" : qrURLText)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .multilineTextAlignment(.center)
+                    Text(LANAddressResolver.primaryIPv4().map { "App: \($0):\(settings.port)" }
+                         ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1571,7 +1565,6 @@ struct WirelessSection: View {
             nowTick = Date()
         }
         .onChange(of: settings.port) { _, _ in refreshQR() }
-        .onChange(of: qrTarget) { _, _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
             refreshPaired()
@@ -1592,16 +1585,12 @@ struct WirelessSection: View {
     private func refreshQR() {
         let token = WirelessAuth.loadOrCreate()
         let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
-        let url: String
-        switch qrTarget {
-        case .browser:
-            url = BrowserStreamServer.buildURL(host: host, streamPort: settings.port, token: token)
-        case .app:
-            // The native client parses `sidescreen://host:port?t=…&name=…` and rejects
-            // any other scheme, so it must get the stream port, not the web port.
-            url = PairingURL.build(host: host, port: settings.port, token: token, name: Host.current().localizedName ?? "Mac")
-        }
+        // App-only pairing. The native client parses `sidescreen://host:port?t=…&name=…`
+        // and rejects any other scheme, so it gets the stream port, not the web port.
+        // BrowserStreamServer stays in the codebase — only the UI path is retired.
+        let url = PairingURL.build(host: host, port: settings.port, token: token, name: Host.current().localizedName ?? "Mac")
         qrImage = QRRenderer.render(url: url, size: 180)
+        qrURLText = url
     }
 
     private func refreshPaired() {

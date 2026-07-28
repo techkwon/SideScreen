@@ -40,4 +40,19 @@ class PreferencesManager(
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
+
+    /**
+     * Follow the device orientation sensor and ask the Mac to rotate to match.
+     * Off by default: the host tears down and recreates the virtual display for a
+     * rotation, costing a reconnect of several seconds, so this should be a
+     * deliberate choice rather than something that fires when the tablet is nudged.
+     */
+    var autoRotate: Boolean
+        get() = prefs.getBoolean("auto_rotate", false)
+        set(value) = prefs.edit().putBoolean("auto_rotate", value).apply()
+
+    /** Fade the floating settings/rotate buttons out after a period of no interaction. */
+    var autoHideButtons: Boolean
+        get() = prefs.getBoolean("auto_hide_buttons", true)
+        set(value) = prefs.edit().putBoolean("auto_hide_buttons", value).apply()
 }

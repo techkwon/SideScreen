@@ -321,10 +321,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         await MainActor.run {
             settings.hasAccessibilityPermission = trusted
         }
+        // debugLog, not print — this has to reach /tmp/sidescreen.log or the state is
+        // invisible when diagnosing "touch does nothing".
         if trusted {
-            print("✅ Accessibility permission granted")
+            debugLog("Accessibility permission granted")
         } else {
-            print("⚠️  Accessibility permission not granted - touch control will not work")
+            debugLog("Accessibility permission NOT granted — touch control will not work")
         }
     }
 
@@ -680,6 +682,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let eventSource = CGEventSource(stateID: .hidSystemState)
     private var accessibilityWarningShown = false
+    private var touchDisabledWarningShown = false
+    private var touchEventCount: UInt64 = 0
     private var gestureState: GestureState = .idle
     private var lastTouchTime: UInt64 = 0
 
@@ -711,12 +715,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Touch Entry Point
 
     func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
-        guard settings.touchEnabled else { return }
+        // Log arrivals before any gate, so "coordinates never reached the Mac" and
+        // "they arrived but were discarded" are distinguishable from the log alone.
+        touchEventCount &+= 1
+        if touchEventCount == 1 || touchEventCount % 120 == 0 {
+            debugLog("Touch #\(touchEventCount) received: x=\(x) y=\(y) action=\(action) pointers=\(pointerCount)")
+        }
+
+        guard settings.touchEnabled else {
+            if !touchDisabledWarningShown {
+                touchDisabledWarningShown = true
+                debugLog("Touch discarded — Touch Input is switched off in Settings")
+            }
+            return
+        }
 
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
-                print("⚠️  Accessibility not granted - touch ignored")
+                debugLog("Touch discarded — Accessibility permission NOT granted. Enable SideScreen in System Settings > Privacy & Security > Accessibility (remove the stale entry first if it is already listed; re-signing invalidates it).")
                 Task { @MainActor in
                     settings.hasAccessibilityPermission = false
                 }
