@@ -1435,7 +1435,17 @@ class ConstrainedWindow: NSWindow {
 struct WirelessSection: View {
     @ObservedObject var settings: DisplaySettings
     let pairedDeviceStore: PairedDeviceStore
+    /// Which client the QR is meant for. The browser viewer lives on the web port
+    /// and speaks http; the native Android client pairs over the stream port with a
+    /// `sidescreen://` deep link and rejects anything else, so one QR cannot serve
+    /// both. Offer the choice instead of silently locking out the native app.
+    enum QRTarget: String, CaseIterable {
+        case browser = "Browser"
+        case app = "Android app"
+    }
+
     @State private var qrImage: NSImage?
+    @State private var qrTarget: QRTarget = .browser
     @State private var pairedDevices: [PairedDevice] = []
     @State private var showResetConfirm = false
     /// Used to force the relative-time labels to recompute every tick even when
@@ -1460,6 +1470,13 @@ struct WirelessSection: View {
             }
             FrostedGroupBox(title: "Pair Device", icon: "qrcode") {
                 VStack(spacing: 8) {
+                    Picker("", selection: $qrTarget) {
+                        ForEach(QRTarget.allCases, id: \.self) { target in
+                            Text(target.rawValue).tag(target)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
                     if let qr = qrImage {
                         Image(nsImage: qr)
                             .interpolation(.none)
@@ -1472,11 +1489,17 @@ struct WirelessSection: View {
                     } else {
                         Text("Generating QR…").foregroundColor(.secondary)
                     }
-                    Text("Scan with the Android camera to open in a browser")
+                    Text(qrTarget == .browser
+                         ? "Scan with the Android camera to open in a browser"
+                         : "Scan from the app's Wireless tab (or the camera) to pair the native H.265 client")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map { "Browser: \($0):\(BrowserStreamServer.webPort(for: settings.port))" } ?? "WiFi disconnected — no LAN address")
+                    Text(LANAddressResolver.primaryIPv4().map {
+                        qrTarget == .browser
+                            ? "Browser: \($0):\(BrowserStreamServer.webPort(for: settings.port))"
+                            : "App: \($0):\(settings.port)"
+                    } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -1548,6 +1571,7 @@ struct WirelessSection: View {
             nowTick = Date()
         }
         .onChange(of: settings.port) { _, _ in refreshQR() }
+        .onChange(of: qrTarget) { _, _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
             refreshPaired()
@@ -1568,7 +1592,15 @@ struct WirelessSection: View {
     private func refreshQR() {
         let token = WirelessAuth.loadOrCreate()
         let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
-        let url = BrowserStreamServer.buildURL(host: host, streamPort: settings.port, token: token)
+        let url: String
+        switch qrTarget {
+        case .browser:
+            url = BrowserStreamServer.buildURL(host: host, streamPort: settings.port, token: token)
+        case .app:
+            // The native client parses `sidescreen://host:port?t=…&name=…` and rejects
+            // any other scheme, so it must get the stream port, not the web port.
+            url = PairingURL.build(host: host, port: settings.port, token: token, name: Host.current().localizedName ?? "Mac")
+        }
         qrImage = QRRenderer.render(url: url, size: 180)
     }
 
