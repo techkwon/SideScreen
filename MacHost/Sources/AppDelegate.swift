@@ -342,16 +342,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Outcome of one adb-reverse attempt. A struct rather than a tuple so the
+    /// three flags stay named at every return site.
+    private struct ADBReverseResult {
+        let installed: Bool
+        let deviceConnected: Bool
+        let reverseConfigured: Bool
+    }
+
     /// Setup ADB reverse port forwarding for USB connection
     func setupADBReverse() async {
         let port = settings.port
         let healthPort = BrowserStreamServer.webPort(for: port)
         debugLog("Setting up ADB reverse for ports \(port), \(healthPort)...")
 
-        let result = await Task.detached(priority: .utility) { () -> (installed: Bool, deviceConnected: Bool, reverseConfigured: Bool) in
+        let result = await Task.detached(priority: .utility) { () -> ADBReverseResult in
             guard let finalAdbPath = StatusDetector.adbExecutablePath() else {
                 debugLog("ADB not found — USB mode cannot configure adb reverse. Install with: brew install android-platform-tools")
-                return (false, false, false)
+                return ADBReverseResult(installed: false, deviceConnected: false, reverseConfigured: false)
             }
 
             debugLog("Found ADB at: \(finalAdbPath)")
@@ -396,7 +404,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 if failedOutputs.isEmpty {
-                    return (true, !devices.isEmpty, true)
+                    return ADBReverseResult(installed: true, deviceConnected: !devices.isEmpty, reverseConfigured: true)
                 } else {
                     debugLog("ADB reverse attempt \(attempt)/3 failed: \(failedOutputs.joined(separator: "; "))")
                     if attempt < 3 {
@@ -406,7 +414,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             debugLog("ADB reverse setup failed. Make sure USB debugging is authorized on the Android device.")
-            return (true, !devices.isEmpty, false)
+            return ADBReverseResult(installed: true, deviceConnected: !devices.isEmpty, reverseConfigured: false)
         }.value
 
         await MainActor.run {
