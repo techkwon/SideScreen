@@ -47,7 +47,11 @@ class GalaxyCameraActivity : AppCompatActivity() {
         private const val EXTRA_CAMERA_HOST = "com.sidescreen.app.CAMERA_HOST"
         private const val EXTRA_CAMERA_PORT = "com.sidescreen.app.CAMERA_PORT"
 
-        fun createIntent(context: Context, host: String = DEFAULT_CAMERA_HOST, port: Int = DEFAULT_CAMERA_PORT): Intent {
+        fun createIntent(
+            context: Context,
+            host: String = DEFAULT_CAMERA_HOST,
+            port: Int = DEFAULT_CAMERA_PORT,
+        ): Intent {
             return Intent(context, GalaxyCameraActivity::class.java)
                 .putExtra(EXTRA_CAMERA_HOST, host)
                 .putExtra(EXTRA_CAMERA_PORT, port)
@@ -114,12 +118,22 @@ class GalaxyCameraActivity : AppCompatActivity() {
 
         binding.cameraPreview.surfaceTextureListener =
             object : TextureView.SurfaceTextureListener {
-                override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                override fun onSurfaceTextureAvailable(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) {
                     startCameraWhenReady()
                 }
 
-                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+                override fun onSurfaceTextureSizeChanged(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) = Unit
+
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+
                 override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
             }
 
@@ -152,8 +166,8 @@ class GalaxyCameraActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             window.decorView.systemUiVisibility =
                 android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                    android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         }
     }
 
@@ -174,18 +188,20 @@ class GalaxyCameraActivity : AppCompatActivity() {
 
     private fun startCameraThread() {
         if (cameraThread != null) return
-        cameraThread = HandlerThread("GalaxyCamera").also { thread ->
-            thread.start()
-            cameraHandler = Handler(thread.looper)
-        }
+        cameraThread =
+            HandlerThread("GalaxyCamera").also { thread ->
+                thread.start()
+                cameraHandler = Handler(thread.looper)
+            }
     }
 
     @SuppressLint("MissingPermission")
     private fun openCamera(cameraId: String?) {
-        val nextCameraId = cameraId ?: run {
-            setStatus("No camera")
-            return
-        }
+        val nextCameraId =
+            cameraId ?: run {
+                setStatus("No camera")
+                return
+            }
         currentCameraId = nextCameraId
         updateCameraCapabilities(nextCameraId)
         val size = chooseOutputSize(nextCameraId)
@@ -193,19 +209,20 @@ class GalaxyCameraActivity : AppCompatActivity() {
         texture.setDefaultBufferSize(size.width, size.height)
         previewSurface = Surface(texture)
 
-        imageReader = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2).apply {
-            setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                try {
-                    val buffer = image.planes[0].buffer
-                    val bytes = ByteArray(buffer.remaining())
-                    buffer.get(bytes)
-                    sendFrame(bytes)
-                } finally {
-                    image.close()
-                }
-            }, cameraHandler)
-        }
+        imageReader =
+            ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    try {
+                        val buffer = image.planes[0].buffer
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+                        sendFrame(bytes)
+                    } finally {
+                        image.close()
+                    }
+                }, cameraHandler)
+            }
 
         cameraManager.openCamera(
             nextCameraId,
@@ -221,7 +238,10 @@ class GalaxyCameraActivity : AppCompatActivity() {
                     setStatus("Camera disconnected")
                 }
 
-                override fun onError(camera: CameraDevice, error: Int) {
+                override fun onError(
+                    camera: CameraDevice,
+                    error: Int,
+                ) {
                     camera.close()
                     cameraDevice = null
                     setStatus("Camera error: $error")
@@ -231,7 +251,10 @@ class GalaxyCameraActivity : AppCompatActivity() {
         )
     }
 
-    private fun createSession(cameraId: String, size: Size) {
+    private fun createSession(
+        cameraId: String,
+        size: Size,
+    ) {
         val camera = cameraDevice ?: return
         val preview = previewSurface ?: return
         val readerSurface = imageReader?.surface ?: return
@@ -261,7 +284,10 @@ class GalaxyCameraActivity : AppCompatActivity() {
         )
     }
 
-    private fun setBaseCaptureOptions(builder: CaptureRequest.Builder, jpegOrientation: Int) {
+    private fun setBaseCaptureOptions(
+        builder: CaptureRequest.Builder,
+        jpegOrientation: Int,
+    ) {
         builder.set(CaptureRequest.JPEG_QUALITY, 70.toByte())
         builder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
@@ -279,7 +305,10 @@ class GalaxyCameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun cameraLabel(id: String, characteristics: CameraCharacteristics): String {
+    private fun cameraLabel(
+        id: String,
+        characteristics: CameraCharacteristics,
+    ): String {
         val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
         val facingLabel =
             when (facing) {

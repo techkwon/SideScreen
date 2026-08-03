@@ -38,9 +38,9 @@ import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.hypot
 import java.net.InetSocketAddress
 import java.net.Socket
+import kotlin.math.hypot
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
@@ -191,7 +191,7 @@ class MainActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             window.addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                    or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
             )
         }
     }

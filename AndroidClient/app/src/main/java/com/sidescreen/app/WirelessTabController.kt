@@ -7,9 +7,9 @@ import android.widget.TextView
 /**
  * Wireless tab state machine for the native Android client.
  *
- * Wireless QR pairing is handled by the phone's Camera app opening the Mac-hosted
- * browser client. The native app keeps cached wireless state for older pairings
- * and remains the USB client.
+ * Pairing runs through the phone's Camera app: the Mac shows a `sidescreen://` QR,
+ * scanning it opens this app via the deep link, and the token in the URL authorises
+ * the stream. There is no in-app scanner, so the Scan button only explains that.
  */
 class WirelessTabController(
     private val views: Views,
@@ -49,8 +49,8 @@ class WirelessTabController(
     private var state: State = State.FIRST_TIME
 
     fun bind() {
-        views.scanButton.setOnClickListener { showBrowserQrInstruction() }
-        views.rescanButton.setOnClickListener { showBrowserQrInstruction() }
+        views.scanButton.setOnClickListener { showPairingInstruction() }
+        views.rescanButton.setOnClickListener { showPairingInstruction() }
         views.forgetButton.setOnClickListener {
             storage.clear()
             transition(State.FIRST_TIME)
@@ -180,10 +180,14 @@ class WirelessTabController(
         transition(State.CONNECTED)
     }
 
-    private fun showBrowserQrInstruction() {
-        views.repairTitle.text = "Open QR with Camera"
+    private fun showPairingInstruction() {
+        views.repairTitle.text = "Scan with the Camera app"
+        // There is no in-app scanner — this app pairs by being opened through the
+        // sidescreen:// deep link the QR carries, so the phone's own Camera app is
+        // what does the scanning.
         views.repairMessage.text =
-            "Scan the Mac QR with the phone Camera app. The browser page can open this app for native wireless streaming, or stay in browser mode."
+            "Open the phone Camera app and point it at the QR on the Mac. " +
+            "It opens Side Screen and connects over WiFi."
         transition(State.REPAIR_NEEDED)
     }
 
