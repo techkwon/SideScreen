@@ -7,9 +7,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.SensorManager
 import android.hardware.usb.UsbManager
+import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -20,7 +23,9 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.view.MotionEvent
 import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.TextureView
 import android.view.View
 import android.view.Window
 import android.view.WindowInsets
@@ -55,9 +60,13 @@ class MainActivity : AppCompatActivity() {
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
+    private var currentTextureSurface: Surface? = null
+    private var decoderUsingTextureView = false
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
+    private var displayFlipHorizontal = false
+    private var displayFlipVertical = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
@@ -354,29 +363,68 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     mainDiag("surfaceChanged: ${width}x$height")
                     log("Surface changed: ${width}x$height")
-                    // Don't initialize decoder here — wait for display config
-                    // from the server so we use the correct resolution.
-                    // Store the holder so we can initialize later.
                     currentSurfaceHolder = holder
                     applyViewportTransform()
-                    // If we already have a display config (reconnect case), init now
-                    if (displayWidth > 0 && displayHeight > 0 && videoDecoder == null) {
-                        initializeDecoder(holder)
-                    }
+                    initializeDecoderForCurrentSurface()
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
                     mainDiag("surfaceDestroyed")
                     log("Surface destroyed")
-                    // Only release decoder, NOT the connection.
-                    videoDecoder?.release()
-                    videoDecoder = null
+                    if (!decoderUsingTextureView) {
+                        videoDecoder?.release()
+                        videoDecoder = null
+                    }
+                    currentSurfaceHolder = null
                 }
             },
         )
 
+        binding.textureView.surfaceTextureListener =
+            object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) {
+                    mainDiag("textureAvailable: ${width}x$height")
+                    currentTextureSurface = Surface(surface)
+                    initializeDecoderForCurrentSurface()
+                }
+
+                override fun onSurfaceTextureSizeChanged(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) {
+                    mainDiag("textureSizeChanged: ${width}x$height")
+                    applyTextureTransform()
+                }
+
+                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                    mainDiag("textureDestroyed")
+                    if (decoderUsingTextureView) {
+                        videoDecoder?.release()
+                        videoDecoder = null
+                    }
+                    currentTextureSurface?.release()
+                    currentTextureSurface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+            }
+
+        if (binding.textureView.isAvailable && currentTextureSurface == null) {
+            binding.textureView.surfaceTexture?.let { currentTextureSurface = Surface(it) }
+        }
+
         binding.surfaceView.setOnTouchListener { view, event ->
             if (event.actionMasked == MotionEvent.ACTION_DOWN) noteUserInteraction()
+            handleTouch(view, event)
+            true
+        }
+        binding.textureView.setOnTouchListener { view, event ->
             handleTouch(view, event)
             true
         }
@@ -548,6 +596,7 @@ class MainActivity : AppCompatActivity() {
 
         val view = dialog.findViewById<View>(android.R.id.content)
         val showStatsSwitch = view.findViewById<SwitchMaterial>(R.id.showStatsSwitch)
+        val hideSettingsSwitch = view.findViewById<SwitchMaterial>(R.id.hideSettingsSwitch)
         val autoRotateSwitch = view.findViewById<SwitchMaterial>(R.id.autoRotateSwitch)
         val autoHideButtonsSwitch = view.findViewById<SwitchMaterial>(R.id.autoHideButtonsSwitch)
         val opacitySlider = view.findViewById<Slider>(R.id.opacitySlider)
@@ -573,6 +622,7 @@ class MainActivity : AppCompatActivity() {
 
         // Load current settings
         showStatsSwitch.isChecked = prefs.showStatsOverlay
+        hideSettingsSwitch.isChecked = prefs.hideSettingsButton
         autoRotateSwitch.isChecked = prefs.autoRotate
         autoHideButtonsSwitch.isChecked = prefs.autoHideButtons
 
@@ -619,6 +669,21 @@ class MainActivity : AppCompatActivity() {
         showStatsSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.showStatsOverlay = isChecked
             updateOverlayVisibility(isChecked)
+        }
+
+        hideSettingsSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.hideSettingsButton = isChecked
+            if (isConnected) {
+                applySettingsButtonVisibility()
+            }
+            if (isChecked) {
+                android.widget.Toast
+                    .makeText(
+                        this,
+                        "Settings icon hidden — use the back gesture to reveal it",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+            }
         }
 
         opacitySlider.addOnChangeListener { _, value, _ ->
@@ -724,6 +789,46 @@ class MainActivity : AppCompatActivity() {
         binding.settingsButton.setOnClickListener {
             showSettingsDialog()
         }
+
+        // Escape hatch for the hidden icon: the back gesture briefly reveals it
+        // instead of leaving the app. Back is not forwarded to the Mac, so this
+        // cannot conflict with streamed touch input.
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : androidx.activity.OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (isConnected && prefs.hideSettingsButton &&
+                        binding.settingsButton.visibility != View.VISIBLE
+                    ) {
+                        revealSettingsButtonTemporarily()
+                    } else {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                        isEnabled = true
+                    }
+                }
+            },
+        )
+    }
+
+    /** Streaming-time visibility of the settings icon, honoring the hide preference. */
+    private fun applySettingsButtonVisibility() {
+        binding.settingsButton.visibility =
+            if (prefs.hideSettingsButton) View.GONE else View.VISIBLE
+    }
+
+    private val revealHandler = Handler(Looper.getMainLooper())
+    private val hideSettingsButtonRunnable =
+        Runnable {
+            if (isConnected && prefs.hideSettingsButton) {
+                binding.settingsButton.visibility = View.GONE
+            }
+        }
+
+    private fun revealSettingsButtonTemporarily() {
+        binding.settingsButton.visibility = View.VISIBLE
+        revealHandler.removeCallbacks(hideSettingsButtonRunnable)
+        revealHandler.postDelayed(hideSettingsButtonRunnable, 5_000L)
     }
 
     private fun setupRotateButton() {
@@ -1024,39 +1129,138 @@ class MainActivity : AppCompatActivity() {
         constraintSet.applyTo(constraintLayout)
     }
 
-    private fun initializeDecoder(holder: SurfaceHolder) {
-        mainDiag(
-            "initializeDecoder called, surface=${holder.surface}, " +
-                "valid=${holder.surface.isValid}, res=${displayWidth}x$displayHeight",
-        )
+    /**
+     * Display config from a new Mac always arrives AFTER codecSelected, so a
+     * missing negotiation at this point proves the Mac app predates H.264
+     * support — surface that instead of a silent black screen.
+     */
+    private fun warnIfAvcOnlyWithoutNegotiation() {
+        if (!CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
+            mainDiag("AVC-only device but Mac did not negotiate codec — Mac app too old")
+            runOnUiThread {
+                updateStatus("This device has no HEVC decoder. Update the SideScreen Mac app to enable H.264 support.")
+            }
+        }
+    }
+
+    /**
+     * Recreate the decoder when the negotiated stream codec doesn't match the
+     * decoder's mime. Display config and codecSelected can arrive in either
+     * order on reconnect; without this, a decoder created with the default
+     * HEVC mime keeps consuming the H.264 stream and never outputs a frame —
+     * a permanent black screen on AVC-only devices (e.g. Unisoc tablets).
+     */
+    private fun onStreamCodecSelected(isHevc: Boolean) {
+        val expectedMime =
+            if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        runOnUiThread {
+            val dec = videoDecoder
+            when {
+                dec == null -> {
+                    mainDiag("Codec selected ($expectedMime) — initializing deferred decoder")
+                    initializeDecoderForCurrentSurface()
+                }
+                dec.mime != expectedMime -> {
+                    mainDiag("Stream codec is $expectedMime but decoder is ${dec.mime} — recreating")
+                    dec.release()
+                    videoDecoder = null
+                    initializeDecoderForCurrentSurface()
+                }
+            }
+        }
+    }
+
+    private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
+
+    private fun activeVideoSurface(): Pair<Surface, Boolean>? {
+        return if (shouldUseTextureView()) {
+            currentTextureSurface?.takeIf { it.isValid }?.let { it to true }
+        } else {
+            currentSurfaceHolder?.surface?.takeIf { it.isValid }?.let { it to false }
+        }
+    }
+
+    private fun initializeDecoderForCurrentSurface() {
         if (displayWidth <= 0 || displayHeight <= 0) {
             mainDiag("initializeDecoder skipped — no display config yet")
             return
         }
+        // AVC-only device: an HEVC decoder can never decode the H.264 stream
+        // the Mac will send — defer until codecSelected arrives, then
+        // onStreamCodecSelected initializes with the correct mime.
+        if (!CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
+            mainDiag("initializeDecoder deferred — AVC-only device awaiting codec negotiation")
+            return
+        }
+
+        val (surface, useTextureView) =
+            activeVideoSurface() ?: run {
+                val kind = if (shouldUseTextureView()) "TextureView" else "SurfaceView"
+                mainDiag("initializeDecoder skipped — no valid $kind surface")
+                return
+            }
+
+        if (videoDecoder != null && decoderUsingTextureView == useTextureView) {
+            videoDecoder?.updateResolution(displayWidth, displayHeight)
+            return
+        }
+
+        videoDecoder?.release()
+        videoDecoder = null
+        decoderUsingTextureView = useTextureView
+
+        mainDiag(
+            "initializeDecoder called, surface=$surface, valid=${surface.isValid}, " +
+                "res=${displayWidth}x$displayHeight, texture=$useTextureView",
+        )
         try {
-            // Pass display for vsync-aligned frame presentation
-            // Use modern API on Android R+, fallback to deprecated for older versions
             val displayObj =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    display // Activity.getDisplay() - modern API
+                    display
                 } else {
                     @Suppress("DEPRECATION")
                     windowManager.defaultDisplay
                 }
-            videoDecoder = VideoDecoder(holder.surface, displayObj, displayWidth, displayHeight)
-            // Wire up buffer release callback
+            val mime =
+                if (streamClient?.streamCodecIsHevc == false) {
+                    MediaFormat.MIMETYPE_VIDEO_AVC
+                } else {
+                    MediaFormat.MIMETYPE_VIDEO_HEVC
+                }
+            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime)
             videoDecoder?.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)
             }
             videoDecoder?.onKeyframeRequired = { force, reason ->
                 streamClient?.requestKeyframe(force = force, reason = reason)
             }
+            videoDecoder?.onDecoderStalled = {
+                // Black screen with live stats: tell the user why instead of
+                // staying silent (issue #41). Toast renders above the (black)
+                // SurfaceView; the settings panel is hidden while streaming.
+                val cap = CodecCapabilities.maxDecodeSize(mime)
+                runOnUiThread {
+                    val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
+                    android.widget.Toast
+                        .makeText(
+                            this,
+                            "No video output — the stream resolution may exceed " +
+                                "this tablet's decoder limit$capText. " +
+                                "Lower the resolution or disable HiDPI on the Mac.",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                }
+            }
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
-            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight, videoDecoder=$videoDecoder")
-            log("✅ Decoder initialized ${displayWidth}x$displayHeight (${displayObj?.refreshRate ?: 60f}Hz)")
+            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
+            log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${displayObj?.refreshRate ?: 60f}Hz)")
         } catch (e: Exception) {
+            decoderUsingTextureView = false
             mainDiag("Decoder init FAILED: ${e.message}")
             log("❌ Failed to initialize decoder: ${e.message}")
+            runOnUiThread {
+                updateStatus("Video decoder failed: ${e.message}")
+            }
         }
     }
 
@@ -1108,7 +1312,7 @@ class MainActivity : AppCompatActivity() {
                     stopChecklistUpdates()
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
-                    binding.settingsButton.visibility = View.VISIBLE
+                    applySettingsButtonVisibility()
                     binding.rotateButton.visibility = View.VISIBLE
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
@@ -1154,29 +1358,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDisplaySize = { width, height, rotation ->
-            mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
+        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
+
+        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+            mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+            warnIfAvcOnlyWithoutNegotiation()
             displayWidth = width
             displayHeight = height
             displayRotation = rotation
-            if (videoDecoder != null) {
-                videoDecoder?.updateResolution(width, height)
-            } else {
-                val holder = currentSurfaceHolder
-                if (holder != null && holder.surface.isValid) {
-                    mainDiag("Display config arrived, initializing decoder ${width}x$height")
-                    runOnUiThread {
-                        if (videoDecoder == null) {
-                            initializeDecoder(holder)
-                        }
-                    }
-                } else {
-                    mainDiag("Display config arrived but no valid surface yet")
-                }
-            }
+            displayFlipHorizontal = flipHorizontal
+            displayFlipVertical = flipVertical
             runOnUiThread {
                 binding.resolutionText.text = "${width}x$height"
-                applyRotation(rotation)
+                applyRotation(rotation, flipHorizontal, flipVertical)
+                initializeDecoderForCurrentSurface()
             }
             log("Display: ${width}x$height @ $rotation°")
         }
@@ -1266,6 +1461,12 @@ class MainActivity : AppCompatActivity() {
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+        runOnUiThread {
+            binding.textureView.visibility = View.GONE
+            applyTextureTransform()
+        }
         log("Disconnected")
     }
 
@@ -1290,6 +1491,8 @@ class MainActivity : AppCompatActivity() {
             disconnect()
             videoDecoder?.release()
             videoDecoder = null
+            currentTextureSurface?.release()
+            currentTextureSurface = null
 
             // Release wake lock safely
             try {
@@ -1310,6 +1513,21 @@ class MainActivity : AppCompatActivity() {
         view: View,
         event: MotionEvent,
     ) {
+        val rawX = event.x / view.width.toFloat()
+        val rawY = event.y / view.height.toFloat()
+        val x = if (displayFlipHorizontal) 1f - rawX else rawX
+        val y = if (displayFlipVertical) 1f - rawY else rawY
+        val pointerCount = event.pointerCount.coerceAtMost(2)
+
+        var x2 = 0f
+        var y2 = 0f
+        if (pointerCount >= 2) {
+            val rawX2 = event.getX(1) / view.width.toFloat()
+            val rawY2 = event.getY(1) / view.height.toFloat()
+            x2 = if (displayFlipHorizontal) 1f - rawX2 else rawX2
+            y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
+        }
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (suppressRemoteUntilAllPointersUp) return
@@ -1473,19 +1691,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Apply rotation by changing the Activity's screen orientation
-     * This provides proper fullscreen portrait/landscape support
-     */
-    private fun applyRotation(rotation: Int) {
+    private fun applyRotation(
+        rotation: Int,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
+    ) {
         requestedOrientation =
             when (rotation) {
                 90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
                 270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
-                else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE // 0°
+                else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             }
 
+        binding.surfaceView.rotation = 0f
+        binding.surfaceView.visibility = View.VISIBLE
+        binding.textureView.visibility = if (flipHorizontal || flipVertical) View.VISIBLE else View.GONE
+        applyTextureTransform()
         resetViewportTransform()
 
         // ConstraintSet handles orientation changes automatically
@@ -1497,8 +1719,22 @@ class MainActivity : AppCompatActivity() {
                 180 -> "Landscape (flipped)"
                 270 -> "Portrait (flipped)"
                 else -> "Landscape"
-            }}",
+            }}${if (flipHorizontal || flipVertical) " mirrored" else ""}",
         )
+    }
+
+    private fun applyTextureTransform() {
+        val view = binding.textureView
+        val matrix = Matrix()
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        matrix.postScale(
+            if (displayFlipHorizontal) -1f else 1f,
+            if (displayFlipVertical) -1f else 1f,
+            centerX,
+            centerY,
+        )
+        view.setTransform(matrix)
     }
 
     /**

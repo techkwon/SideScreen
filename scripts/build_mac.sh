@@ -75,6 +75,8 @@ mkdir -p "$APP_DIR/Contents/Resources"
 # Copy universal binary
 cp "$SCRATCH_PATH/release-universal/SideScreen" "$APP_DIR/Contents/MacOS/"
 
+# No LaunchAgent plist needed for SMAppService.mainApp
+
 # Copy app icon if exists
 if [ -f "$ROOT_DIR/MacHost/Resources/AppIcon.icns" ]; then
     cp "$ROOT_DIR/MacHost/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/"
@@ -104,7 +106,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>13.0</string>
     <key>LSUIElement</key>
     <false/>
     <key>NSHighResolutionCapable</key>

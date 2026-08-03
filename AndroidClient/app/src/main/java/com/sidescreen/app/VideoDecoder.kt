@@ -18,6 +18,9 @@ class VideoDecoder(
     private val display: Display? = null,
     initialWidth: Int = 1920,
     initialHeight: Int = 1200,
+    // Exposed so MainActivity can detect a codec-negotiation/decoder mismatch
+    // and recreate the decoder (see MainActivity.onStreamCodecSelected).
+    val mime: String = MediaFormat.MIMETYPE_VIDEO_HEVC,
 ) {
     private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
@@ -56,6 +59,14 @@ class VideoDecoder(
     var onFrameDecoded: ((ByteArray) -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
 
+    /** Fired once when the decoder has accepted many frames but never output any —
+     *  the black-screen-with-live-stats signature (stream above the device's
+     *  decode limit, or an unusable decoder). Counts only frames actually queued
+     *  to MediaCodec, so pre-keyframe drops on a slow start can't trigger it. */
+    var onDecoderStalled: (() -> Unit)? = null
+    private var stallReported = false
+    private var queuedInputCount = 0L
+
     // Available input buffer indices — fed by onInputBufferAvailable callback
     private val availableInputBuffers = ConcurrentLinkedQueue<Int>()
 
@@ -88,7 +99,7 @@ class VideoDecoder(
             if (decoderName != null) {
                 MediaCodec.createByCodecName(decoderName)
             } else {
-                MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                MediaCodec.createDecoderByType(mime)
             }
 
         val callback =
@@ -129,7 +140,7 @@ class VideoDecoder(
 
         val format =
             MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_HEVC,
+                mime,
                 currentWidth,
                 currentHeight,
             )
@@ -156,7 +167,7 @@ class VideoDecoder(
             try {
                 val basicFormat =
                     MediaFormat.createVideoFormat(
-                        MediaFormat.MIMETYPE_VIDEO_HEVC,
+                        mime,
                         currentWidth,
                         currentHeight,
                     )
@@ -177,7 +188,7 @@ class VideoDecoder(
             try {
                 val minimalFormat =
                     MediaFormat.createVideoFormat(
-                        MediaFormat.MIMETYPE_VIDEO_HEVC,
+                        mime,
                         currentWidth,
                         currentHeight,
                     )
@@ -206,7 +217,7 @@ class VideoDecoder(
     }
 
     /**
-     * Find the best HEVC decoder for the given resolution.
+     * Find the best decoder for [mime] at the given resolution.
      * Prefers hardware decoders, falls back to software if HW can't handle the resolution.
      * Returns codec name to use with MediaCodec.createByCodecName(), or null for default.
      */
@@ -226,7 +237,7 @@ class VideoDecoder(
                 if (info.isEncoder) continue
                 val caps =
                     try {
-                        info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                        info.getCapabilitiesForType(mime)
                     } catch (_: Exception) {
                         continue
                     }
@@ -245,7 +256,7 @@ class VideoDecoder(
                         }
 
                 diagLog(
-                    "HEVC decoder '${info.name}': " +
+                    "$mime decoder '${info.name}': " +
                         "width=${videoCaps.supportedWidths}, " +
                         "height=${videoCaps.supportedHeights}, " +
                         "hw=$isHardware, supports ${width}x$height=$supported, " +
@@ -312,7 +323,6 @@ class VideoDecoder(
                     "dropped=$droppedFrames, availBufs=${availableInputBuffers.size}",
             )
         }
-
         val codec =
             decoder ?: run {
                 diagLog("decoder is null in decode()")
@@ -367,6 +377,12 @@ class VideoDecoder(
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            queuedInputCount++
+            if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
+                stallReported = true
+                diagLog("Decoder stalled: $queuedInputCount frames queued, none out")
+                onDecoderStalled?.invoke()
+            }
             if (isKeyframe) {
                 needsKeyframe = false
             }
@@ -526,6 +542,7 @@ class VideoDecoder(
 
     companion object {
         private const val TAG = "VideoDecoder"
+        private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L

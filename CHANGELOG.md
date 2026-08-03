@@ -17,6 +17,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+<a id="0.11.1"></a>
+## [0.11.1] - 2026-07-19
+
+Safety and quality-of-life release. Fixes the headless lockout that could force a recovery boot (#39), the remaining random black screen on reconnect (#44), and black screens on tablets whose video decoder can't keep up with high resolutions (#41) — plus display flip for teleprompter setups contributed by @peterdenham (#28).
+
+### Added
+- **Horizontal/Vertical flip (#28).** Two new toggles next to Rotation on the Mac mirror the picture left↔right and/or top↕bottom — built for teleprompter rigs. Touch input is mirrored to match. Contributed by @peterdenham. *Requires updating both the Mac app and the Android app*: with an older Android app, enabling flip shows an unflipped picture and temporarily forces landscape until the tablet is updated.
+- **Decoder-aware resolution (#41).** The tablet now tells the Mac the maximum size its hardware video decoder can actually handle, and the Mac scales the stream to fit (aspect preserved). High resolutions + HiDPI no longer black-screen on budget tablets — they just stream at the largest size the device can decode. Fully backward compatible in both directions. If decoding still fails, the tablet now shows a clear message naming its decoder limit instead of staying silently black.
+- **Hide settings icon (#36).** New toggle in the tablet's streaming settings hides the floating settings button — handy for drawing and teleprompter use. Swipe back to reveal it for a few seconds.
+- **Menu bar quick actions.** The Mac menu bar icon now shows live status (stopped / waiting / connected with device name), Start/Stop Streaming, and a USB↔Wireless mode switch — no need to open the settings window. The icon dims while the server is stopped.
+
+### Fixed
+- **Headless lockout (#39, severity 0).** After using the tablet as the Mac's only screen, the app could restore the invisible virtual display as the *main* display on the next auto-start — menu bar, dock, and keyboard focus moved to a screen nobody could see, which looked like a completely dead Mac and forced a recovery boot. Three layers of protection now guarantee a physically attached display always owns the main slot: the saved main-slot position is never re-applied while a physical display is online, the invariant is re-asserted on every display-topology change (including hot-plugging a display into a running headless Mac, which now hands the main slot back immediately), and display arrangements are no longer written into WindowServer's permanent preferences.
+- **Random black screen on reconnect (#44, follow-up to #40).** Display config and codec negotiation can arrive in either order on reconnect; a decoder created with the wrong codec now recreates itself instead of silently consuming the stream forever. Contributed by @ltminh88.
+- **Start button double-trigger.** Rapid double Start (menu bar or settings window) can no longer create two virtual displays or bind the port twice.
+
+### Installation
+- **macOS**: Open `SideScreen-0.11.1-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.1-android.apk` (enable "Unknown sources" if needed).
+
+---
+
+<a id="0.11.0"></a>
+## [0.11.0] - 2026-06-29
+
+Headless auto-start. The Mac host can launch at login and start streaming automatically, so a Mac with no display of its own can boot up and serve the tablet with nothing to press on the Mac — the tablet's own Connect (USB) / Reconnect (Wireless) button is the only thing you touch. Building on the headless groundwork contributed by @shhrohan (#25), reworked to keep wireless mode and the existing settings UI intact, and to start the server *declaratively at launch* rather than reacting to USB plug/unplug events.
+
+### Added
+- **Launch at Login.** Registers the host as a login item (`SMAppService`) so it starts silently in the background after you log in. New toggle in the Settings → "Startup" group.
+- **Auto-start streaming on launch + Startup mode.** When enabled, the server starts automatically when the app opens, in the connection mode (USB or Wireless) you choose. The server then stays up and listens; the tablet connects/reconnects whenever, with no action required on the Mac.
+- **Self-healing USB bridge.** `adb reverse` is now re-established automatically whenever a device is present but the forward is missing (replug, adb-server restart, …), instead of only on the USB connect edge.
+
+### Notes
+- The server lifecycle is no longer tied to USB plug/unplug — it does not auto-stop on disconnect, so the virtual display (and your window layout) persists across tablet reconnects. The tablet's existing Connect / Reconnect buttons remain the connection path; nothing on the Mac needs pressing.
+- First-time setup still needs a screen once (to grant Screen Recording permission); afterwards the Mac can run fully headless. For wireless headless use, pin the Mac to a static IP / DHCP reservation — automatic discovery (mDNS) is still planned.
+
+### Installation
+- **macOS**: Open `SideScreen-0.11.0-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.0-android.apk` (enable "Unknown sources" if needed).
+
+---
+
+<a id="0.10.1"></a>
+## [0.10.1] - 2026-06-12
+
+Wireless connection fix. Several people reported the tablet connecting at the TCP level but the Mac never responding — the loading screen hung forever and only flipped to "Couldn't reach Mac" when the server stopped. This was most common on mobile hotspots and carrier-NAT networks. Contributed by @akashraj9828 (#26, closes #10).
+
+### Fixed
+- **Wireless connection hangs in "Connecting…" on many networks.** The Mac host enabled TCP Fast Open on its listener, but the Android client uses standard TCP (no TFO). On networks with middleboxes (mobile hotspot, carrier NAT), the connection's `NWConnection` stayed in `.preparing` and never reached `.ready`, so the auth handshake never ran and the Mac stayed silent at the application layer — even though the TCP handshake itself completed. Removing the Fast Open option lets the connection establish normally. USB was unaffected (loopback has no middleboxes), which is why it always worked. `noDelay` (Nagle's algorithm disabled) — the optimization that actually matters for streaming latency — is kept.
+
+### Installation
+- **macOS**: Open `SideScreen-0.10.1-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.10.1-android.apk` (enable "Unknown sources" if needed).
+
+---
+
+<a id="0.10.0"></a>
+## [0.10.0] - 2026-06-12
+
+Compatibility release: H.264 fallback for tablets that have no HEVC decoder (e-ink devices like the Onyx Boox line), macOS 13 Ventura support for older Intel Macs, and a custom-resolution Apply that actually applies.
+
+### Added
+- **H.264 fallback for devices without an HEVC decoder.** Side Screen streamed HEVC only, so tablets whose firmware ships no HEVC decoder (e.g. Onyx Boox Nova Air C) connected fine but showed a black screen — frames arrived, nothing could decode them. The Android client now probes `MediaCodecList` once at connect and, when HEVC is missing, advertises it to the Mac, which switches the encoder to H.264 (Main profile) and clamps the encode resolution to the 1920×1088 floor that every AVC hardware decoder meets — preserving aspect ratio, 16-aligned. Devices with HEVC keep streaming HEVC exactly as before; the fallback only activates where today there was nothing. Thanks to Devin Lange for the report and the adb diagnostics that pinned the root cause.
+- **macOS 13 (Ventura) support.** The deployment target dropped from macOS 14 to 13, so 2017+ Intel Macs stuck on Ventura can run the host. The binary was already universal (arm64 + x86_64); only one macOS 14-only API stood in the way. App-bundle metadata (`LSMinimumSystemVersion`) now matches. Heads-up: ScreenCaptureKit and the virtual-display private API are less battle-tested on 13 — reports welcome.
+
+### Fixed
+- **Custom resolution "Apply" did nothing.** Three stacked bugs: the W/H fields only committed their text when you pressed Return (clicking Apply read stale values, and locale formatting injected grouping separators like "1.920"); nothing listened for resolution changes while the server ran, so even a committed change sat idle until a manual stop/start; and out-of-range values were rejected silently. Now Apply reads exactly what you typed, the server restarts itself (~2 s, the tablet reconnects) whenever the resolution changes mid-run — picker rows included — the applied custom value shows up highlighted in the resolution list, and out-of-range input disables Apply and shows the supported range (640–7680 × 480–4320).
+
+### Notes
+- Two new wire-protocol messages (`9` client-is-AVC-only, `10` codec-selected), both strictly opt-in: an old Mac safely ignores type 9 (payload-free by design), and type 10 is only ever sent to clients that asked. Every mixed old/new pairing on HEVC-capable devices behaves byte-identically to 0.9.1. The one combination that still can't stream — AVC-only tablet against an old Mac — now shows "update the Mac app" on the tablet instead of a silent black screen. Update both sides to get the fallback.
+- H.264 is a less efficient codec than HEVC; on AVC-only devices expect the clamped resolution (e.g. a 1872×1404 panel streams at 1440×1088) and slightly softer text than an HEVC device would get. That trade buys a working screen on hardware that previously had none.
+
+### Installation
+- **macOS**: Open `SideScreen-0.10.0-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Now requires macOS 13 (Ventura) or later — was 14.
+- **Android**: Install `SideScreen-0.10.0-android.apk` (enable "Unknown sources" if needed).
+
+---
+
 <a id="0.9.1"></a>
 ## [0.9.1] - 2026-05-18
 

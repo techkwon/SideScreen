@@ -21,14 +21,16 @@ class VideoEncoder {
     var onEncodedFrame: ((inout Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
     private var width: Int
     private var height: Int
+    let codec: StreamCodec
     private var bitrateMbps: Int = 20
     private var quality: String = "medium"
     private var gamingBoost: Bool = false
     private var frameRate: Int = 60
     private let stateLock = OSAllocatedUnfairLock(initialState: EncoderState())
-    init(width: Int, height: Int, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60) {
+    init(width: Int, height: Int, codec: StreamCodec = .hevc, bitrateMbps: Int = 20, quality: String = "ultralow", gamingBoost: Bool = false, frameRate: Int = 60) {
         self.width = width
         self.height = height
+        self.codec = codec
         // Gaming Boost used to pin this to 50 regardless of what was passed, which
         // made a lower wireless budget unreachable. The caller already folds Gaming
         // Boost into the number it sends (SettingsStore.effectiveBitrate).
@@ -62,7 +64,7 @@ class VideoEncoder {
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
-            codecType: kCMVideoCodecType_HEVC, // H.265
+            codecType: codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
             encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -80,7 +82,14 @@ class VideoEncoder {
 
         // Ultra-low latency config for real-time streaming
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
+        // H.264 Main profile: decodable by every AVC hardware decoder
+        // (Baseline/Main/High all accept Main-constrained streams' feature
+        // set we use). High adds 8x8 transform that some low-end vendor OMX
+        // decoders reject — not worth the marginal gain for screen content.
+        let profile: CFString = codec == .hevc
+            ? kVTProfileLevel_HEVC_Main_AutoLevel
+            : kVTProfileLevel_H264_Main_AutoLevel
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
 
         // Dynamic bitrate - remove strict rate limiting for smoother streaming.
         // The old `max(bitrateMbps, 60)` floor dated from the all-intra era and
@@ -130,7 +139,7 @@ class VideoEncoder {
         VTCompressionSessionPrepareToEncodeFrames(session)
 
         let mode = gamingBoost ? "🎮 GAMING BOOST" : quality.uppercased()
-        debugLog("VideoToolbox encoder configured (H.265, \(bitrateMbps)Mbps, \(frameRate)fps, \(mode))")
+        debugLog("VideoToolbox encoder configured (\(codec == .hevc ? "H.265" : "H.264"), \(bitrateMbps)Mbps, \(frameRate)fps, \(mode))")
     }
 
     /// Force the next encoded frame to be an IDR (sync) frame.
@@ -237,14 +246,27 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
 
     if isKeyframe {
         if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            // Get parameter sets (SPS, PPS, VPS for H.265)
+            // Prepend parameter sets: VPS/SPS/PPS for HEVC, SPS/PPS for H.264.
             var parameterSetCount: Int = 0
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &parameterSetCount, nalUnitHeaderLengthOut: nil)
+            let countStatus: OSStatus
+            if encoder.codec == .hevc {
+                countStatus = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &parameterSetCount, nalUnitHeaderLengthOut: nil)
+            } else {
+                countStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDescription, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &parameterSetCount, nalUnitHeaderLengthOut: nil)
+            }
+            if countStatus != noErr {
+                debugLog("Parameter set count query failed: \(countStatus) — keyframe sent without SPS/PPS")
+                parameterSetCount = 0
+            }
 
             for i in 0..<parameterSetCount {
                 var parameterSetPointer: UnsafePointer<UInt8>?
                 var parameterSetSize: Int = 0
-                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, parameterSetIndex: i, parameterSetPointerOut: &parameterSetPointer, parameterSetSizeOut: &parameterSetSize, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                if encoder.codec == .hevc {
+                    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, parameterSetIndex: i, parameterSetPointerOut: &parameterSetPointer, parameterSetSizeOut: &parameterSetSize, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                } else {
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDescription, parameterSetIndex: i, parameterSetPointerOut: &parameterSetPointer, parameterSetSizeOut: &parameterSetSize, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                }
 
                 if let pointer = parameterSetPointer {
                     frameData.append(contentsOf: nalStartCode)

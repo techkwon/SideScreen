@@ -23,7 +23,7 @@
 
 ![Swift](https://img.shields.io/badge/Swift-FA7343?style=for-the-badge&logo=swift&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS_14+-000000?style=for-the-badge&logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS_13+-000000?style=for-the-badge&logo=apple&logoColor=white)
 ![Android](https://img.shields.io/badge/Android_8+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
 ![Universal Binary](https://img.shields.io/badge/Universal_Binary-Apple_Silicon_+_Intel-000000?style=for-the-badge&logo=apple&logoColor=white)
 
@@ -97,6 +97,10 @@ Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–500
   <img src="resources/screenshots/android_settings.png" alt="Android — Connection Screen" height="500"/>
 </div>
 
+### Headless / portable Mac (new in 0.11.0)
+
+Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a laptop in clamshell — using the tablet as its only screen. Enable Launch at Login and Auto-start streaming, and the Mac boots straight into serving the tablet, with nothing to press on the Mac.
+
 <p align="right"><a href="#readme-top">↑ Back to top</a></p>
 
 ---
@@ -105,7 +109,7 @@ Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–500
 
 | | macOS Host | Android Client |
 |---|---|---|
-| **OS** | macOS 14 (Sonoma)+ | Android 8.0 (API 26)+ |
+| **OS** | macOS 13 (Ventura)+ | Android 8.0 (API 26)+ |
 | **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
 | **USB mode** | USB-C port + `adb` (`brew install android-platform-tools`) | USB-C cable + USB Debugging enabled |
 | **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Any modern browser opened from the device Camera QR scan |
@@ -175,6 +179,12 @@ cd AndroidClient && ./gradlew assembleDebug
 Wireless mode requires both devices to be on the same WiFi network. **5 GHz is strongly recommended** — 2.4 GHz can introduce noticeable jitter on dynamic content. If you need to revoke access, click **Reset Token (forget all)** on the Mac and re-pair each tablet.
 
 USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wireless adds 10–50 ms depending on WiFi quality.
+
+### Headless mode (new in 0.11.0 — no Mac interaction)
+
+In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
+
+First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
 
 ---
 

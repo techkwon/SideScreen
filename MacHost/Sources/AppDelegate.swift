@@ -56,7 +56,6 @@ struct GestureThresholds {
     static let minTouchInterval: UInt64 = 8_000_000    // ~120Hz
 }
 
-@available(macOS 14.0, *)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var streamingServer: StreamingServer?
     var browserStreamServer: BrowserStreamServer?
@@ -75,7 +74,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
+    /// Reentrancy latch for startServer() — a second Start (double-clicked menu
+    /// item, auto-start racing a manual click) must not build a second virtual
+    /// display / server. Main-actor confined.
     private var isStartingServer = false
+    var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
@@ -113,8 +116,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refreshStatusIndicators()
         }
 
-        // Show settings window
-        showSettings()
+        if #available(macOS 13.0, *) {
+            if DaemonManager.shared.isEnabled {
+                print("🚀 Launch at Login is enabled - starting silently in background")
+                // Do not show settings window automatically.
+                // applicationShouldHandleReopen will show it if the user manually launched the app.
+            } else {
+                showSettings()
+            }
+        } else {
+            showSettings()
+        }
+
+        // Declarative auto-start (no Mac interaction): start the server in the
+        // chosen Startup mode if enabled. No blocking permission modal here —
+        // it cannot be acted on when the Mac is headless.
+        if settings.autoStartStreamingOnLaunch {
+            settings.connectionMode = settings.startupMode
+            Task {
+                await self.checkPermissions()
+                if self.settings.hasScreenRecordingPermission {
+                    await self.startServer()
+                } else {
+                    debugLog("Auto-start skipped: Screen Recording permission not granted")
+                }
+            }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showSettings()
+        }
+        return true
     }
 
     @MainActor
@@ -138,8 +172,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let reverseOK = StatusDetector.adbReverseConfigured(port: port)
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
-                self.settings.usbDeviceConnected = !devices.isEmpty
+                
+                let isConnected = !devices.isEmpty
+
+                self.settings.usbDeviceConnected = isConnected
                 self.settings.adbReverseConfigured = reverseOK
+
+                // Self-healing USB bridge (level-triggered, not edge-triggered):
+                // whenever we are in USB mode with the server running and a
+                // device present but adb reverse missing, (re)establish it.
+                // Covers replug, adb-server restart, etc. The server lifecycle
+                // is NOT tied to device events — it stays up and the tablet
+                // reconnects via its own connect button.
+                if self.settings.connectionMode == .usb
+                    && isConnected
+                    && self.settings.isRunning
+                    && !reverseOK {
+                    debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
+                    Task { await self.setupADBReverse() }
+                }
             }
         }
     }
@@ -199,21 +250,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Display geometry changes require a new virtual display. Recreate the
-        // stream so the browser/native clients receive the newly selected size.
-        Publishers.CombineLatest4(
-            settings.$resolution,
-            settings.$hiDPI,
-            settings.$refreshRate,
-            settings.$rotation
-        )
+        // Rotation and flips are a live transform upstream — no display rebuild,
+        // so no reconnect. Resolution has its own restart observer below.
+        Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
+            .dropFirst()
+            .sink { [weak self] rotation, flipHorizontal, flipVertical in
+                guard let self = self, self.settings.isRunning else { return }
+                debugLog("Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+                self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
+            }
+            .store(in: &cancellables)
+
+        // HiDPI and refresh rate still change the virtual display itself, so they
+        // need the rebuild that rotation no longer does.
+        Publishers.CombineLatest(settings.$hiDPI, settings.$refreshRate)
             .dropFirst()
             .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
-            .sink { [weak self] resolution, hiDPI, refreshRate, rotation in
+            .sink { [weak self] hiDPI, refreshRate in
                 guard let self = self, self.settings.isRunning else { return }
                 Task { @MainActor in
                     await self.restartServerForDisplayChange(
-                        reason: "\(resolution), HiDPI=\(hiDPI), \(refreshRate)Hz, rotation=\(rotation)"
+                        reason: "HiDPI=\(hiDPI), \(refreshRate)Hz"
                     )
                 }
             }
@@ -238,22 +295,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
+
+        // Observer cho resolution changes — the virtual display is created at
+        // server start, so a new resolution (list row or custom Apply) needs a
+        // stop/start cycle to take effect, same as a connection-mode change.
+        // Without this, changing resolution mid-run silently did nothing.
+        settings.$resolution
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] resolution in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    guard self.settings.isRunning else { return }
+                    debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
+                    self.stopServer()
+                    await self.startServer()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Virtual Display")
+            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Side Screen")
         }
 
+        // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
+        // reflects live server/connection state.
         let menu = NSMenu()
-
-        menu.addItem(NSMenuItem(title: "Settings", action: #selector(showSettings), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
+        menu.delegate = self
+        menu.autoenablesItems = false
         statusItem?.menu = menu
+
+        // Dim the menu bar icon while the server is stopped — at-a-glance
+        // state without opening the menu.
+        settings.$isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] running in
+                self?.statusItem?.button?.appearsDisabled = !running
+            }
+            .store(in: &cancellables)
+    }
+
+    @objc private func toggleServerFromMenu() {
+        if settings.isRunning {
+            stopServer()
+        } else {
+            Task { [weak self] in
+                await self?.startServer()
+            }
+        }
+    }
+
+    @objc private func selectUSBMode() {
+        guard settings.connectionMode != .usb else { return }
+        settings.connectionMode = .usb
+    }
+
+    @objc private func selectWirelessMode() {
+        guard settings.connectionMode != .wireless else { return }
+        settings.connectionMode = .wireless
     }
 
     func setupSettingsWindow() {
@@ -354,7 +457,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupADBReverse() async {
         let port = settings.port
         let healthPort = BrowserStreamServer.webPort(for: port)
-        debugLog("Setting up ADB reverse for ports \(port), \(healthPort)...")
+        debugLog("🔌 setupADBReverse() invoked for ports \(port), \(healthPort)...")
 
         let result = await Task.detached(priority: .utility) { () -> ADBReverseResult in
             guard let finalAdbPath = StatusDetector.adbExecutablePath() else {
@@ -448,24 +551,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startServer() async {
-        guard !isStartingServer else {
-            debugLog("Start ignored — server start already in progress")
+        let canStart = await MainActor.run { () -> Bool in
+            guard !isStartingServer, !settings.isRunning else { return false }
+            isStartingServer = true
+            return true
+        }
+        guard canStart else {
+            debugLog("startServer() ignored — already starting or already running")
             return
         }
-        isStartingServer = true
-        defer { isStartingServer = false }
+        defer {
+            Task { @MainActor [weak self] in self?.isStartingServer = false }
+        }
+        debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
 
-        if settings.isRunning ||
-            streamingServer != nil ||
-            browserStreamServer != nil ||
-            screenCapture != nil ||
-            virtualDisplayManager != nil {
+        // Objects can outlive a previous run even when isRunning is false (a failed
+        // start, or a stop that raced a restart); clear them before building new ones.
+        if streamingServer != nil || browserStreamServer != nil ||
+            screenCapture != nil || virtualDisplayManager != nil {
             debugLog("Cleaning up existing server state before start")
             stopServer()
             try? await Task.sleep(nanoseconds: 600_000_000)
         }
-
         guard settings.hasScreenRecordingPermission else {
+            debugLog("❌ startServer aborted: Missing Screen Recording permission")
             await showPermissionAlert()
             return
         }
@@ -552,13 +661,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // logical dimensions here makes the resolution overlay on Android
             // match the Mac's resolution dropdown (e.g. "2560x1600" instead of
             // the HiDPI-doubled "5120x3200").
-            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation)
+            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
                     self.settings.clientConnected = true
                 }
+            }
+            // Runs synchronously on the server's network queue BEFORE the
+            // display config is sent, so the config below carries the right
+            // dimensions for the negotiated codec.
+            streamingServer?.onCodecNegotiated = { [weak self] codec in
+                guard let self = self, let capture = self.screenCapture else { return }
+                capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
+                let enc = capture.encodeSize(for: codec)
+                // Unclamped HEVC keeps the logical user-picked resolution,
+                // exactly as at startup; any clamped size (client decoder
+                // limit, or the AVC floor) must match what the stream's SPS
+                // will carry so the client sizes its decoder correctly.
+                let unclampedHevc = codec == .hevc && enc == (capture.displayWidth, capture.displayHeight)
+                let (w, h) = unclampedHevc ? (size.width, size.height) : (enc.width, enc.height)
+                self.streamingServer?.setDisplaySize(width: w, height: h, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
@@ -1108,5 +1232,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+}
+
+// MARK: - Menu bar quick actions
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // Live status line (not clickable)
+        let statusTitle: String
+        if settings.isRunning {
+            if settings.clientConnected {
+                let device = settings.currentWirelessDevice ?? "tablet"
+                statusTitle = "🟢 Connected — \(device)"
+            } else {
+                statusTitle = "🟡 Waiting for tablet on port \(settings.port)"
+            }
+        } else {
+            statusTitle = "⚪️ Server stopped"
+        }
+        let statusLine = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
+        menu.addItem(.separator())
+
+        // Start / Stop
+        let toggle = NSMenuItem(
+            title: settings.isRunning ? "Stop Streaming" : "Start Streaming",
+            action: #selector(toggleServerFromMenu),
+            keyEquivalent: "t"
+        )
+        toggle.target = self
+        // Mirror the settings-window Start button: starting needs the Screen
+        // Recording permission, stopping is always allowed.
+        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
+        menu.addItem(toggle)
+
+        // Connection mode (switching while running restarts the server, same
+        // as changing it in the settings window)
+        let modeMenu = NSMenu()
+        modeMenu.autoenablesItems = false
+        let usb = NSMenuItem(title: "USB", action: #selector(selectUSBMode), keyEquivalent: "")
+        usb.target = self
+        usb.state = settings.connectionMode == .usb ? .on : .off
+        modeMenu.addItem(usb)
+        let wireless = NSMenuItem(title: "Wireless", action: #selector(selectWirelessMode), keyEquivalent: "")
+        wireless.target = self
+        wireless.state = settings.connectionMode == .wireless ? .on : .off
+        modeMenu.addItem(wireless)
+        let modeItem = NSMenuItem(title: "Connection Mode", action: nil, keyEquivalent: "")
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
+
+        menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "s")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Side Screen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 }

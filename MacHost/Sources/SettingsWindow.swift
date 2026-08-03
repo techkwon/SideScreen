@@ -3,7 +3,6 @@ import SwiftUI
 
 // MARK: - Frosted GroupBox Component
 
-@available(macOS 14.0, *)
 struct FrostedGroupBox<Content: View, Trailing: View>: View {
     let title: String
     var icon: String?
@@ -38,7 +37,6 @@ struct FrostedGroupBox<Content: View, Trailing: View>: View {
     }
 }
 
-@available(macOS 14.0, *)
 extension FrostedGroupBox where Trailing == EmptyView {
     init(title: String, icon: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
@@ -50,7 +48,6 @@ extension FrostedGroupBox where Trailing == EmptyView {
 
 // MARK: - Visual Effect Blur
 
-@available(macOS 14.0, *)
 struct VisualEffectBlur: NSViewRepresentable {
     var material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode
@@ -73,12 +70,24 @@ struct VisualEffectBlur: NSViewRepresentable {
 
 // MARK: - Settings View
 
-@available(macOS 14.0, *)
 struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
     @State private var showPermissionAlert = false
     @State private var showResetConfirmation = false
     @State private var headerHovered = false
+    // Plain strings for the custom resolution fields: TextField(value:format:)
+    // only commits on Return/focus-loss, so clicking Apply read stale values,
+    // and .number formatting injected locale grouping separators ("1,200").
+    @State private var customWidthText = ""
+    @State private var customHeightText = ""
+    @State private var daemonEnabled = false
+
+    private var customWidthValue: Int? { Int(customWidthText.trimmingCharacters(in: .whitespaces)) }
+    private var customHeightValue: Int? { Int(customHeightText.trimmingCharacters(in: .whitespaces)) }
+    private var customResolutionValid: Bool {
+        guard let w = customWidthValue, let h = customHeightValue else { return false }
+        return DisplaySettings.isValidCustomResolution(width: w, height: h)
+    }
 
     var body: some View {
         ZStack {
@@ -195,6 +204,23 @@ struct SettingsView: View {
                                     ScrollView {
                                         VStack(alignment: .leading, spacing: 0) {
                                             if settings.showAllResolutions {
+                                                // Custom (Apply) values aren't in any preset group —
+                                                // surface them so the selection is visible in the list.
+                                                if !DisplaySettings.allResolutions.contains(settings.resolution) {
+                                                    HStack(spacing: 6) {
+                                                        Text("Custom")
+                                                            .font(.system(size: 11, weight: .semibold))
+                                                        Text("User defined")
+                                                            .font(.system(size: 10))
+                                                            .foregroundColor(.secondary)
+                                                    }
+                                                    .padding(.horizontal, 12)
+                                                    .padding(.vertical, 6)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .background(Color.primary.opacity(0.03))
+
+                                                    ResolutionRow(resolution: settings.resolution, isSelected: true) {}
+                                                }
                                                 ForEach(DisplaySettings.resolutionGroups) { group in
                                                     HStack(spacing: 6) {
                                                         Text(group.name)
@@ -220,6 +246,11 @@ struct SettingsView: View {
                                                         settings.resolution = res
                                                     }
                                                 }
+                                                // Current selection from the full list or a custom
+                                                // Apply — keep it visible in the compact list too.
+                                                if !DisplaySettings.commonResolutions.contains(settings.resolution) {
+                                                    ResolutionRow(resolution: settings.resolution, isSelected: true) {}
+                                                }
                                             }
                                         }
                                     }
@@ -233,19 +264,34 @@ struct SettingsView: View {
 
                                     if settings.showAllResolutions {
                                         HStack(spacing: 8) {
-                                            TextField("W", value: $settings.customWidth, format: .number)
+                                            TextField("W", text: $customWidthText)
                                                 .textFieldStyle(.roundedBorder)
                                                 .frame(width: 70)
                                             Text("x")
                                                 .foregroundColor(.secondary)
-                                            TextField("H", value: $settings.customHeight, format: .number)
+                                            TextField("H", text: $customHeightText)
                                                 .textFieldStyle(.roundedBorder)
                                                 .frame(width: 70)
                                             Button("Apply") {
+                                                guard customResolutionValid,
+                                                      let w = customWidthValue,
+                                                      let h = customHeightValue else { return }
+                                                settings.customWidth = w
+                                                settings.customHeight = h
                                                 settings.applyCustomResolution()
                                             }
                                             .buttonStyle(.bordered)
                                             .controlSize(.small)
+                                            .disabled(!customResolutionValid)
+                                        }
+                                        .onAppear {
+                                            customWidthText = String(settings.customWidth)
+                                            customHeightText = String(settings.customHeight)
+                                        }
+                                        if !customResolutionValid {
+                                            Text("Supported range: 640–7680 × 480–4320")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.orange)
                                         }
                                     }
                                     if settings.isRunning {
@@ -283,6 +329,7 @@ struct SettingsView: View {
                                             RoundedRectangle(cornerRadius: 4)
                                                 .stroke(Color.accentColor.opacity(0.5), lineWidth: 1)
                                                 .frame(width: 80, height: 50)
+                                                .scaleEffect(x: settings.flipHorizontal ? -1 : 1, y: settings.flipVertical ? -1 : 1)
                                                 .rotationEffect(.degrees(Double(settings.rotation)))
 
                                             Text(settings.rotation == 90 || settings.rotation == 270 ? "Portrait" : "Landscape")
@@ -318,6 +365,39 @@ struct SettingsView: View {
                                             .font(.system(size: 10))
                                             .foregroundColor(.accentColor)
                                     }
+
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Flip Horizontally")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(.secondary)
+                                                Text("Mirror left and right")
+                                                    .font(.system(size: 10))
+                                                    .foregroundColor(.secondary.opacity(0.7))
+                                            }
+                                            Spacer()
+                                            Toggle("", isOn: $settings.flipHorizontal)
+                                                .toggleStyle(.switch)
+                                                .controlSize(.mini)
+                                        }
+
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Flip Vertically")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(.secondary)
+                                                Text("Mirror top and bottom")
+                                                    .font(.system(size: 10))
+                                                    .foregroundColor(.secondary.opacity(0.7))
+                                            }
+                                            Spacer()
+                                            Toggle("", isOn: $settings.flipVertical)
+                                                .toggleStyle(.switch)
+                                                .controlSize(.mini)
+                                        }
+                                    }
+                                    .padding(.top, 4)
 
                                     HStack {
                                         Spacer()
@@ -429,6 +509,80 @@ struct SettingsView: View {
                         if settings.connectionMode == .wireless {
                             WirelessSection(settings: settings,
                                             pairedDeviceStore: (NSApp.delegate as? AppDelegate)?.pairedDeviceStore ?? PairedDeviceStore())
+                        }
+
+                        // Startup / headless behaviour
+                        FrostedGroupBox(title: "Startup", icon: "power") {
+                            VStack(alignment: .leading, spacing: 12) {
+                                if #available(macOS 13.0, *) {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Launch at Login")
+                                                .font(.system(size: 12, weight: .medium))
+                                            Text("Run SideScreen in the background automatically after you log in.")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        Toggle("", isOn: Binding(
+                                            get: { daemonEnabled },
+                                            set: { newValue in
+                                                do {
+                                                    if newValue {
+                                                        try DaemonManager.shared.enable()
+                                                    } else {
+                                                        try DaemonManager.shared.disable()
+                                                    }
+                                                } catch {
+                                                    print("Daemon toggle failed: \(error)")
+                                                }
+                                                daemonEnabled = DaemonManager.shared.isEnabled
+                                            }
+                                        ))
+                                        .labelsHidden()
+                                    }
+                                    Divider()
+                                }
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Auto-start streaming on launch")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text("Start the server automatically when the app opens, so the tablet can connect without touching the Mac.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Toggle("", isOn: $settings.autoStartStreamingOnLaunch)
+                                        .labelsHidden()
+                                }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Startup mode")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text("Which connection mode to start in when auto-starting.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Picker("", selection: $settings.startupMode) {
+                                        Text("USB").tag(ConnectionMode.usb)
+                                        Text("Wireless").tag(ConnectionMode.wireless)
+                                    }
+                                    .pickerStyle(.segmented)
+                                    .labelsHidden()
+                                    .frame(width: 150)
+                                    .disabled(!settings.autoStartStreamingOnLaunch)
+                                }
+                            }
+                        }
+                        .onAppear {
+                            if #available(macOS 13.0, *) {
+                                daemonEnabled = DaemonManager.shared.isEnabled
+                            }
                         }
 
                         // Gaming Boost
@@ -836,7 +990,6 @@ struct SettingsView: View {
 
 // MARK: - Supporting Views
 
-@available(macOS 14.0, *)
 struct StatusRow: View {
     let title: String
     let status: String
@@ -882,7 +1035,6 @@ struct StatusRow: View {
     }
 }
 
-@available(macOS 14.0, *)
 struct GalaxyCameraPreviewPanel: View {
     @State private var frameImage: NSImage?
     @State private var copiedLabel: String?
@@ -1005,7 +1157,6 @@ struct GalaxyCameraPreviewPanel: View {
     }
 }
 
-@available(macOS 14.0, *)
 struct URLCopyRow: View {
     let title: String
     let url: String
@@ -1039,7 +1190,6 @@ struct URLCopyRow: View {
     }
 }
 
-@available(macOS 14.0, *)
 struct ResolutionRow: View {
     let resolution: String
     let isSelected: Bool
@@ -1068,7 +1218,6 @@ struct ResolutionRow: View {
     }
 }
 
-@available(macOS 14.0, *)
 struct BitrateButton: View {
     let label: String
     let value: Int
@@ -1107,7 +1256,6 @@ struct BitrateButton: View {
     }
 }
 
-@available(macOS 14.0, *)
 struct RotationButton: View {
     let degrees: Int
     let label: String
@@ -1152,7 +1300,6 @@ struct RotationButton: View {
 
 // MARK: - Display Settings
 
-@available(macOS 14.0, *)
 class DisplaySettings: ObservableObject {
     private let defaults = UserDefaults.standard
     private let keyPrefix = "SideScreen_"
@@ -1181,6 +1328,12 @@ class DisplaySettings: ObservableObject {
     @Published var rotation: Int {
         didSet { save("rotation", rotation) }
     }
+    @Published var flipHorizontal: Bool {
+        didSet { save("flipHorizontal", flipHorizontal) }
+    }
+    @Published var flipVertical: Bool {
+        didSet { save("flipVertical", flipVertical) }
+    }
     @Published var showAllResolutions: Bool {
         didSet { save("showAllResolutions", showAllResolutions) }
     }
@@ -1195,6 +1348,12 @@ class DisplaySettings: ObservableObject {
     }
     @Published var connectionMode: ConnectionMode {
         didSet { save("connectionMode", connectionMode.rawValue) }
+    }
+    @Published var autoStartStreamingOnLaunch: Bool {
+        didSet { save("autoStartStreamingOnLaunch", autoStartStreamingOnLaunch) }
+    }
+    @Published var startupMode: ConnectionMode {
+        didSet { save("startupMode", startupMode.rawValue) }
     }
 
     // Runtime state (not persisted)
@@ -1228,12 +1387,18 @@ class DisplaySettings: ObservableObject {
         // Existing users keep their saved value.
         self.port = UInt16(defaults.object(forKey: keyPrefix + "port") as? Int ?? 54321)
         self.rotation = defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0
+        self.flipHorizontal = defaults.bool(forKey: keyPrefix + "flipHorizontal")
+        self.flipVertical = defaults.bool(forKey: keyPrefix + "flipVertical")
         self.showAllResolutions = defaults.bool(forKey: keyPrefix + "showAllResolutions")
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
+        // This fork pairs over WiFi by default; upstream still defaults to USB.
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.wireless.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .wireless
+        self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
+        let startupRaw = defaults.string(forKey: keyPrefix + "startupMode") ?? modeRaw
+        self.startupMode = ConnectionMode(rawValue: startupRaw) ?? .wireless
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1316,8 +1481,9 @@ class DisplaySettings: ObservableObject {
 
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
-                    "gamingBoost", "port", "rotation", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "connectionMode"]
+                    "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
+                    "customWidth", "customHeight", "touchEnabled", "connectionMode",
+                    "autoStartStreamingOnLaunch", "startupMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1330,11 +1496,15 @@ class DisplaySettings: ObservableObject {
         gamingBoost = false
         port = 54321
         rotation = 0
+        flipHorizontal = false
+        flipVertical = false
         showAllResolutions = false
         customWidth = 1920
         customHeight = 1200
         touchEnabled = true
         connectionMode = .wireless
+        autoStartStreamingOnLaunch = false
+        startupMode = .wireless
 
         print("Settings reset to defaults")
     }
@@ -1349,8 +1519,12 @@ class DisplaySettings: ObservableObject {
         return (baseWidth, baseHeight)
     }
 
+    static func isValidCustomResolution(width: Int, height: Int) -> Bool {
+        width >= 640 && width <= 7680 && height >= 480 && height <= 4320
+    }
+
     func applyCustomResolution() {
-        if customWidth >= 640 && customWidth <= 7680 && customHeight >= 480 && customHeight <= 4320 {
+        if DisplaySettings.isValidCustomResolution(width: customWidth, height: customHeight) {
             resolution = "\(customWidth)x\(customHeight)"
         }
     }
@@ -1358,7 +1532,6 @@ class DisplaySettings: ObservableObject {
 
 // MARK: - Window Controller
 
-@available(macOS 14.0, *)
 class SettingsWindowController: NSWindowController, NSWindowDelegate {
     convenience init(settings: DisplaySettings) {
         let window = ConstrainedWindow(
@@ -1407,7 +1580,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
-@available(macOS 14.0, *)
 class ConstrainedWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
         guard let screen = screen ?? self.screen ?? NSScreen.main else {
@@ -1437,7 +1609,6 @@ class ConstrainedWindow: NSWindow {
 
 // MARK: - Wireless Section
 
-@available(macOS 14.0, *)
 struct WirelessSection: View {
     @ObservedObject var settings: DisplaySettings
     let pairedDeviceStore: PairedDeviceStore
@@ -1564,7 +1735,10 @@ struct WirelessSection: View {
             refreshPaired()
             nowTick = Date()
         }
-        .onChange(of: settings.port) { _, _ in refreshQR() }
+        // One-parameter onChange(of:perform:) works on macOS 13+. The
+        // two-parameter form requires macOS 14 and would block Ventura.
+        // Deprecation is a compile-time warning only on Xcode 15+ SDKs.
+        .onChange(of: settings.port) { _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
             refreshPaired()

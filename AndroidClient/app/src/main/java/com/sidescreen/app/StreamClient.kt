@@ -32,8 +32,19 @@ class StreamClient(
     // receive timestamp, and whether the frame can restart HEVC decoding.
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
-    var onDisplaySize: ((Int, Int, Int) -> Unit)? = null // width, height, rotation
+    var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
+
+    /** Invoked when the server confirms the stream codec (true = HEVC). */
+    var onCodecSelected: ((Boolean) -> Unit)? = null
+
+    /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
+    @Volatile var streamCodecIsHevc = true
+        private set
+
+    /** True once a MESSAGE_CODEC_SELECTED arrived — distinguishes new Macs from old. */
+    @Volatile var codecNegotiated = false
+        private set
 
     private var bytesReceived = 0L
     private var framesReceived = 0L
@@ -113,6 +124,10 @@ class StreamClient(
                     }
                 inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
+                streamCodecIsHevc = true
+                codecNegotiated = false
+                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -238,6 +253,10 @@ class StreamClient(
                 socket = s
                 inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
+                streamCodecIsHevc = true
+                codecNegotiated = false
+                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -269,6 +288,34 @@ class StreamClient(
         }
     }
 
+    private fun advertiseAvcOnlyIfNeeded() {
+        if (CodecCapabilities.hasHevcDecoder) return
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
+            out.flush()
+            diagLog("Advertised AVC-only (no HEVC decoder on this device)")
+        }
+    }
+
+    private fun advertiseDecoderLimits() {
+        val (maxW, maxH) = CodecCapabilities.maxDecodeSize(CodecCapabilities.streamMime) ?: return
+        val w = maxW.coerceAtMost(16383)
+        val h = maxH.coerceAtMost(16383)
+        if (w < 256 || h < 256) return
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
+            // 7 data bits per byte with the high bit always set: an old Mac
+            // skips unknown types one byte at a time, so payload bytes must
+            // never collide with real message-type values.
+            out.writeByte(0x80 or ((w shr 7) and 0x7F))
+            out.writeByte(0x80 or (w and 0x7F))
+            out.writeByte(0x80 or ((h shr 7) and 0x7F))
+            out.writeByte(0x80 or (h and 0x7F))
+            out.flush()
+            diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
+        }
+    }
+
     private suspend fun receiveData() =
         withContext(Dispatchers.IO) {
             val input = inputStream ?: return@withContext
@@ -286,12 +333,16 @@ class StreamClient(
                             receiveVideoFrame(input, hasMetadata = true)
                         }
 
-                        1 -> { // Display size + rotation
+                        1 -> {
                             val width = input.readInt()
                             val height = input.readInt()
-                            val rotation = input.readInt()
-                            diagLog("Display config: ${width}x$height @ $rotation°")
-                            onDisplaySize?.invoke(width, height, rotation)
+                            val transform = input.readInt()
+                            val rotation = transform % 1000
+                            val flags = transform / 1000
+                            val flipHorizontal = flags and 1 == 1
+                            val flipVertical = flags and 2 == 2
+                            diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                            onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
                         }
 
                         5 -> { // Pong response — measure round-trip latency
@@ -300,6 +351,14 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_CODEC_SELECTED -> {
+                            val codecId = input.readByte().toInt()
+                            streamCodecIsHevc = codecId == 0
+                            codecNegotiated = true
+                            diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
+                            onCodecSelected?.invoke(streamCodecIsHevc)
                         }
 
                         else -> {
@@ -478,7 +537,7 @@ class StreamClient(
         input.readFully(frameData, 0, frameSize)
 
         if (!hasMetadata && !isKeyframe) {
-            isKeyframe = isHevcSyncFrame(frameData, frameSize)
+            isKeyframe = isSyncFrame(frameData, frameSize, streamCodecIsHevc)
         }
 
         // Capture timestamp after full frame received for accurate age tracking.
@@ -568,13 +627,27 @@ class StreamClient(
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
-        private const val MESSAGE_ROTATION_REQUEST = 9
+        private const val MESSAGE_CLIENT_AVC_ONLY = 9
+        private const val MESSAGE_CODEC_SELECTED = 10
+        private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+
+        // Fork-only. Upstream took 9-11 for codec negotiation, so the rotation
+        // request moved up rather than colliding — a collision here would not fail
+        // to compile, it would silently make one side act on the other's message.
+        private const val MESSAGE_ROTATION_REQUEST = 12
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 
-        private fun isHevcSyncFrame(
+        /**
+         * Codec-aware sync-frame (keyframe) detection on the legacy
+         * MESSAGE_VIDEO_FRAME path. HEVC: IRAP NAL types 16..21 from
+         * (header and 0x7E) shr 1. H.264: IDR slice, (header and 0x1F) == 5.
+         * Internal (not private) so unit tests can exercise both branches.
+         */
+        internal fun isSyncFrame(
             data: ByteArray,
             size: Int,
+            isHevc: Boolean,
         ): Boolean {
             var i = 0
             while (i + 5 < size) {
@@ -602,8 +675,14 @@ class StreamClient(
                 val nalStart = start + startCodeLength
                 if (nalStart + 1 >= size) return false
 
-                val nalType = (data[nalStart].toInt() and 0x7E) shr 1
-                if (nalType in 16..21) {
+                val header = data[nalStart].toInt()
+                val isSync =
+                    if (isHevc) {
+                        ((header and 0x7E) shr 1) in 16..21
+                    } else {
+                        (header and 0x1F) == 5
+                    }
+                if (isSync) {
                     return true
                 }
 

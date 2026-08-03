@@ -11,7 +11,21 @@ private enum WireMessage {
     static let videoFrameWithMetadata: UInt8 = 6
     static let keyframeRequest: UInt8 = 7
     static let clientSupportsFrameMetadata: UInt8 = 8
-    static let displayRotationRequest: UInt8 = 9
+    /// Client→server, payload-free (old hosts consume 1 byte safely):
+    /// "this device has no HEVC decoder".
+    static let clientAvcOnly: UInt8 = 9
+    /// Server→client, 1-byte payload (StreamCodec.wireId). Sent ONLY to
+    /// clients that sent clientAvcOnly — old clients disconnect on unknown
+    /// message types, so this must never be sent unsolicited.
+    static let codecSelected: UInt8 = 10
+    /// Client→server, 4-byte payload: the client's max decode size (issue
+    /// #41). Every payload byte has the high bit set, so old hosts that
+    /// consume unknown types byte-by-byte skip the payload harmlessly.
+    static let clientDecoderLimits: UInt8 = 11
+    /// Fork-only, client→server: requested display rotation in degrees.
+    /// Upstream claimed 9-11, so this moved up. A collision would not fail to
+    /// build — it would silently make each side act on the other's message.
+    static let displayRotationRequest: UInt8 = 12
 }
 
 private extension NWEndpoint {
@@ -36,6 +50,10 @@ class StreamingServer {
     private var connection: NWConnection?
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
+    /// Fired once per connection during protocol startup, BEFORE the display
+    /// config is sent, for every outcome (.hevc or .h264) — so the capture
+    /// pipeline can also revert to HEVC after an AVC-only client goes away.
+    var onCodecNegotiated: ((StreamCodec) -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
     var onStats: ((Double, Double) -> Void)?
@@ -66,6 +84,11 @@ class StreamingServer {
         // stay false until the display config is actually on the wire.
         var startupClaimed = false
         var inFlightFrames = 0
+        // Codec negotiation state from upstream. Written on receiveQueue and read
+        // during startup, so it belongs under the same lock as the other flags
+        // rather than sitting in unsynchronised properties.
+        var clientIsAvcOnly = false
+        var clientDecodeLimits: (width: Int, height: Int)?
     }
     private let sendLock = OSAllocatedUnfairLock(initialState: SendState())
 
@@ -100,8 +123,15 @@ class StreamingServer {
     private var displayWidth = 1920
     private var displayHeight = 1080
     private var rotation = 0
+    private var flipHorizontal = false
+    private var flipVertical = false
     private var isReceiving = false
     private var isStopped = false
+    /// Max decode size reported by the connected client (issue #41).
+    var clientDecodeLimits: (width: Int, height: Int)? {
+        sendLock.withLock { $0.clientDecodeLimits }
+    }
+    private var clientIsAvcOnly: Bool { sendLock.withLock { $0.clientIsAvcOnly } }
     private var inputBuffer = Data()
 
     init(port: UInt16) {
@@ -157,6 +187,8 @@ class StreamingServer {
             state.waitingForSyncFrame = true
             state.startupClaimed = false
             state.inFlightFrames = 0
+            state.clientIsAvcOnly = false
+            state.clientDecodeLimits = nil
         }
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -219,6 +251,20 @@ class StreamingServer {
         }
         guard !alreadyStarted else { return }
 
+        let codec: StreamCodec = clientIsAvcOnly ? .h264 : .hevc
+        if clientIsAvcOnly {
+            // Safe to send: this client opted in via type 9. Must precede the
+            // display config so the client knows the codec before it sizes
+            // and configures its decoder.
+            let msg = Data([WireMessage.codecSelected, codec.wireId])
+            conn.send(content: msg, completion: .contentProcessed { _ in })
+            debugLog("Sent codecSelected: H.264")
+        }
+        // Synchronous, before sendDisplaySize(): the handler switches the
+        // encoder AND updates displayWidth/Height (clamped for H.264) so the
+        // display config below carries decoder-safe dimensions.
+        onCodecNegotiated?(codec)
+
         debugLog("Client connected - sending display config first")
         // Order matters: the client must have the display config before the first
         // video frame, so the gate only opens once the config is queued.
@@ -227,7 +273,7 @@ class StreamingServer {
             state.connectionReady = true
             return state.clientSupportsFrameMetadata
         }
-        debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"))")
+        debugLog("Connection ready for frames (metadata=\(metadata ? "on" : "off"), codec=\(codec))")
         onClientConnected?()
     }
 
@@ -299,29 +345,33 @@ class StreamingServer {
         })
     }
 
-    func setDisplaySize(width: Int, height: Int, rotation: Int = 0) {
+    func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
         displayWidth = width
         displayHeight = height
         self.rotation = rotation
+        self.flipHorizontal = flipHorizontal
+        self.flipVertical = flipVertical
     }
 
-    /// Update rotation and send to connected client
-    func updateRotation(_ rotation: Int) {
+    func updateDisplayTransform(rotation: Int, flipHorizontal: Bool, flipVertical: Bool) {
         self.rotation = rotation
-        sendDisplaySize() // Re-send display config with new rotation
+        self.flipHorizontal = flipHorizontal
+        self.flipVertical = flipVertical
+        sendDisplaySize()
     }
 
     func sendDisplaySize() {
         guard let connection = connection else { return }
 
+        let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0)
         var data = Data()
-        data.append(WireMessage.displayConfig) // Type: Display size + rotation
+        data.append(WireMessage.displayConfig)
         data.append(contentsOf: withUnsafeBytes(of: Int32(displayWidth).bigEndian) { Data($0) })
         data.append(contentsOf: withUnsafeBytes(of: Int32(displayHeight).bigEndian) { Data($0) })
-        data.append(contentsOf: withUnsafeBytes(of: Int32(rotation).bigEndian) { Data($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
 
         connection.send(content: data, completion: .contentProcessed { _ in })
-        debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°")
+        debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
     }
 
     private func startReceivingTouch() {
@@ -425,6 +475,36 @@ class StreamingServer {
                     debugLog("Client supports video frame metadata")
                 }
                 finishProtocolStartup(on: connection)
+
+            case WireMessage.clientAvcOnly:
+                // Payload-free opt-in (same convention as type 8): the client
+                // has no HEVC decoder, stream H.264 instead. Clients send this
+                // BEFORE type 8, so it lands before finishProtocolStartup runs.
+                consumeInputBytes(1)
+                if !clientIsAvcOnly {
+                    sendLock.withLock { $0.clientIsAvcOnly = true }
+                    debugLog("Client is AVC-only — will negotiate H.264")
+                }
+
+            case WireMessage.clientDecoderLimits:
+                // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
+                // bits each with the high bit always set (old hosts skip the
+                // payload harmlessly). Sent BEFORE type 8, like type 9.
+                guard inputBuffer.count >= 5 else { return }
+
+                let payload = (1...4).map { inputByte(at: $0) }
+                consumeInputBytes(5)
+                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
+                    debugLog("Malformed decoder-limits payload — ignoring")
+                    continue
+                }
+                let w = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
+                let h = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+                // Anything below QVGA-ish is a nonsense report — ignore it.
+                if w >= 256 && h >= 256 {
+                    sendLock.withLock { $0.clientDecodeLimits = (w, h) }
+                    debugLog("Client decoder limit: \(w)x\(h)")
+                }
 
             case WireMessage.displayRotationRequest:
                 // Android client rotation request: type + Int32 little-endian degrees.
